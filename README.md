@@ -70,7 +70,7 @@ threads
 
 ## Self-Hosting
 
-See [packages/relay](packages/relay) for Wrangler deployment instructions.
+See [packages/relay](packages/relay) for Cloudflare deployment instructions.
 
 ## Security Model
 
