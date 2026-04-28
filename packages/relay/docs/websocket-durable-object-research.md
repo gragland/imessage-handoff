@@ -10,6 +10,19 @@ The important catch is delivery semantics. A pure "do not store inbound messages
 
 Recommended direction: keep the current D1-backed pending reply path as the reliable fallback, and add a Durable Object WebSocket fast path later if latency or polling load becomes a real problem.
 
+## Current Experiment
+
+The relay includes a minimal WebSocket probe at `GET /threads/:threadId/events`.
+
+- The endpoint authenticates the thread, then proxies the WebSocket upgrade to a `RemoteThreadSocket` Durable Object keyed by thread ID.
+- The local Stop hook opens this socket when it starts waiting for remote input.
+- The Stop hook sends a `stop-hook-connected` probe message.
+- The Durable Object replies with an `ack` message confirming receipt.
+- The Stop hook ignores the ack for delivery and keeps polling as the source of truth.
+- The Stop hook closes the socket when that Stop hook exits; it does not keep a daemon connection open across assistant turns.
+
+This validates connection setup, upgrade routing, and per-stop teardown without changing Sendblue delivery.
+
 ## Current Path
 
 Today, inbound delivery is intentionally durable but short-lived:

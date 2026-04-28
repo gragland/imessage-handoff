@@ -1,5 +1,6 @@
 export interface Env {
   DB: D1Database;
+  REMOTE_THREAD_SOCKET?: DurableObjectNamespace;
   SENDBLUE_API_KEY?: string;
   SENDBLUE_SECRET_KEY?: string;
   SENDBLUE_WEBHOOK_SECRET?: string;

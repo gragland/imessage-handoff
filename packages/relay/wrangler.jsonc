@@ -15,6 +15,20 @@
       "migrations_dir": "./src/db/migrations"
     }
   ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "REMOTE_THREAD_SOCKET",
+        "class_name": "RemoteThreadSocket"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["RemoteThreadSocket"]
+    }
+  ],
   "vars": {
     "SENDBLUE_FROM_NUMBER": "+16452468235",
     "SENDBLUE_API_BASE_URL": "https://api.sendblue.com/api",

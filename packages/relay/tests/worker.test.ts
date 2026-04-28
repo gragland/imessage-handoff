@@ -409,6 +409,47 @@ test("creates and upserts a remote thread with an explicit id", async () => {
   assert.equal(body.remoteEnabled, true);
 });
 
+test("proxies authorized thread websocket upgrades to the Durable Object", async () => {
+  const testEnv: Env = env();
+  const threadId = await register(testEnv);
+  const calls: Array<{ name: string; url: string }> = [];
+  testEnv.REMOTE_THREAD_SOCKET = {
+    idFromName(name: string) {
+      return { name } as unknown as DurableObjectId;
+    },
+    get(id: DurableObjectId) {
+      return {
+        id,
+        fetch: async (request: Request) => {
+          calls.push({ name: (id as unknown as { name: string }).name, url: request.url });
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+      } as unknown as DurableObjectStub;
+    },
+  } as unknown as DurableObjectNamespace;
+
+  const response = await handleRequest(req(`/threads/${threadId}/events?token=dev-token`, {
+    headers: { upgrade: "websocket" },
+  }), testEnv);
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(calls, [{
+    name: threadId,
+    url: `https://remote-control.test/threads/${threadId}/events?token=dev-token`,
+  }]);
+});
+
+test("rejects unauthorized thread websocket upgrades", async () => {
+  const testEnv = env();
+  const threadId = await register(testEnv);
+
+  const response = await handleRequest(req(`/threads/${threadId}/events?token=wrong-token`, {
+    headers: { upgrade: "websocket" },
+  }), testEnv);
+
+  assert.equal(response.status, 401);
+});
+
 test("pairs a phone by code without enqueueing a pending reply", async () => {
   const testEnv = env();
   const threadId = await register(testEnv, {

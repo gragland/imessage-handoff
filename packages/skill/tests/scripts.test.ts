@@ -376,6 +376,15 @@ test("publish-stop exits quietly after status when no remote reply is pending", 
     "POST /threads/codex-thread-1/status",
     "GET /threads/codex-thread-1/pending",
   ]);
+  assert.deepEqual(mock.websocketCalls.map((call: { method: string; path: string; body: { type: string } }) => ({
+    method: call.method,
+    path: call.path,
+    type: call.body.type,
+  })), [{
+    method: "WS",
+    path: "/threads/codex-thread-1/events",
+    type: "stop-hook-connected",
+  }]);
   const active = JSON.parse(readFileSync(path.join(stateDir, "active-threads.json"), "utf8"));
   assert.equal(active.threads["codex-thread-1"].lastStopAt !== null, true);
 });

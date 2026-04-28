@@ -7,6 +7,8 @@ const path = require("path");
 const { apiFetch, readActiveThreads, readConfig, stateDir, writeActiveThreads } = require("./common.js");
 
 const LOCAL_ONLY_START = "**Remote message**";
+const WS_CONNECTING = 0;
+const WS_OPEN = 1;
 
 async function readStdinJson() {
   return new Promise(function readStdin(resolve, reject) {
@@ -152,6 +154,70 @@ async function downloadReplyMedia(codexThreadId, reply) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function threadEventsUrl(config, codexThreadId) {
+  const url = new URL(config.apiBaseUrl);
+  url.protocol = url.protocol === "http:" ? "ws:" : "wss:";
+  url.pathname = `/threads/${encodeURIComponent(codexThreadId)}/events`;
+  url.search = "";
+  url.searchParams.set("token", config.token);
+  return url.toString();
+}
+
+function recordMockWebSocketProbe(config, codexThreadId, payload) {
+  if (!process.env.REMOTE_CONTROL_MOCK_FILE) {
+    return false;
+  }
+
+  const mockPath = process.env.REMOTE_CONTROL_MOCK_FILE;
+  const mock = existsSync(mockPath) ? JSON.parse(readFileSync(mockPath, "utf8")) : {};
+  mock.websocketCalls = Array.isArray(mock.websocketCalls) ? mock.websocketCalls : [];
+  mock.websocketCalls.push({
+    method: "WS",
+    path: `/threads/${codexThreadId}/events`,
+    authorization: "Bearer " + config.token,
+    body: payload,
+  });
+  writeFileSync(mockPath, JSON.stringify(mock, null, 2) + "\n", "utf8");
+  return true;
+}
+
+function startWebSocketProbe(config, codexThreadId) {
+  const payload = {
+    type: "stop-hook-connected",
+    threadId: codexThreadId,
+    sentAt: new Date().toISOString(),
+  };
+
+  if (recordMockWebSocketProbe(config, codexThreadId, payload)) {
+    return { close: function closeMockProbe() {} };
+  }
+  if (typeof WebSocket !== "function") {
+    return null;
+  }
+
+  try {
+    const socket = new WebSocket(threadEventsUrl(config, codexThreadId));
+    socket.addEventListener("open", function onOpen() {
+      socket.send(JSON.stringify(payload));
+    });
+    socket.addEventListener("message", function onMessage() {
+      // Probe-only path: receipt is useful for platform validation, not delivery.
+    });
+    socket.addEventListener("error", function onError() {
+      // Polling remains authoritative, so socket failures stay silent.
+    });
+    return {
+      close: function closeProbe() {
+        if (socket.readyState === WS_CONNECTING || socket.readyState === WS_OPEN) {
+          socket.close(1000, "stop hook finished");
+        }
+      },
+    };
+  } catch {
+    return null;
+  }
 }
 
 function codexHome() {
@@ -309,35 +375,42 @@ async function waitForReplyWhileActive(config, codexThreadId) {
   const deadline = Date.now() + Math.max(0, config.stopPollSeconds) * 1000;
   const intervalMs = Math.max(1, config.stopPollIntervalSeconds) * 1000;
   const localFollowUpCheckMs = 250;
+  const websocketProbe = startWebSocketProbe(config, codexThreadId);
 
-  while (true) {
-    const active = readActiveThreads();
-    if (!active.threads[codexThreadId]) {
-      return null;
-    }
-    if (hasQueuedLocalFollowUp(codexThreadId)) {
-      await disableRemoteSilently(config, codexThreadId, active);
-      return null;
-    }
-
-    const reply = await claimNextReply(config, codexThreadId);
-    if (reply) {
-      return reply;
-    }
-    if (Date.now() >= deadline) {
-      return null;
-    }
-    const sleepUntil = Date.now() + Math.min(intervalMs, Math.max(0, deadline - Date.now()));
-    while (Date.now() < sleepUntil) {
-      await sleep(Math.min(localFollowUpCheckMs, Math.max(0, sleepUntil - Date.now())));
-      const latestActive = readActiveThreads();
-      if (!latestActive.threads[codexThreadId]) {
+  try {
+    while (true) {
+      const active = readActiveThreads();
+      if (!active.threads[codexThreadId]) {
         return null;
       }
       if (hasQueuedLocalFollowUp(codexThreadId)) {
-        await disableRemoteSilently(config, codexThreadId, latestActive);
+        await disableRemoteSilently(config, codexThreadId, active);
         return null;
       }
+
+      const reply = await claimNextReply(config, codexThreadId);
+      if (reply) {
+        return reply;
+      }
+      if (Date.now() >= deadline) {
+        return null;
+      }
+      const sleepUntil = Date.now() + Math.min(intervalMs, Math.max(0, deadline - Date.now()));
+      while (Date.now() < sleepUntil) {
+        await sleep(Math.min(localFollowUpCheckMs, Math.max(0, sleepUntil - Date.now())));
+        const latestActive = readActiveThreads();
+        if (!latestActive.threads[codexThreadId]) {
+          return null;
+        }
+        if (hasQueuedLocalFollowUp(codexThreadId)) {
+          await disableRemoteSilently(config, codexThreadId, latestActive);
+          return null;
+        }
+      }
+    }
+  } finally {
+    if (websocketProbe) {
+      websocketProbe.close();
     }
   }
 }

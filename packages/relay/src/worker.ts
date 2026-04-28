@@ -48,6 +48,49 @@ interface ReplyMedia {
   url: string;
 }
 
+export class RemoteThreadSocket {
+  private readonly state: DurableObjectState;
+
+  constructor(state: DurableObjectState) {
+    this.state = state;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+      return error(426, "WebSocket upgrade required.");
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.state.acceptWebSocket(server);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    const text = typeof message === "string"
+      ? message
+      : new TextDecoder().decode(message);
+    let parsed: JsonRecord | null = null;
+    try {
+      const value = JSON.parse(text) as unknown;
+      parsed = isRecord(value) ? value : null;
+    } catch {
+      parsed = null;
+    }
+
+    ws.send(JSON.stringify({
+      type: "ack",
+      received: true,
+      receivedAt: nowIso(),
+      messageType: optionalString(parsed?.type),
+    }));
+  }
+
+  async webSocketClose(ws: WebSocket, code: number, reason: string) {
+    ws.close(code, reason);
+  }
+}
+
 function json(data: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(data, null, 2), {
     ...init,
@@ -78,6 +121,10 @@ function authToken(request: Request) {
   const header = request.headers.get("authorization") ?? "";
   const match = header.match(/^Bearer\s+(.+)$/i);
   return match?.[1]?.trim() ?? "";
+}
+
+function authTokenFromRequestOrUrl(request: Request) {
+  return authToken(request) || new URL(request.url).searchParams.get("token")?.trim() || "";
 }
 
 function requireString(value: unknown, name: string) {
@@ -994,6 +1041,24 @@ async function handleStopThread(request: Request, env: Env, threadId: string) {
   return json({ ok: true, id: threadId, remoteEnabled: false, nextActiveThreadId });
 }
 
+async function handleThreadEvents(request: Request, env: Env, threadId: string) {
+  if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+    return error(426, "WebSocket upgrade required.");
+  }
+  const token = authTokenFromRequestOrUrl(request);
+  if (!token) {
+    throw Object.assign(new Error("Unauthorized."), { status: 401 });
+  }
+  const ownerId = await ownerIdFromToken(token);
+  assertAuthorized(await findThread(env, threadId), ownerId);
+  if (!env.REMOTE_THREAD_SOCKET) {
+    return error(500, "Remote thread socket Durable Object is not configured.");
+  }
+
+  const id = env.REMOTE_THREAD_SOCKET.idFromName(threadId);
+  return env.REMOTE_THREAD_SOCKET.get(id).fetch(request);
+}
+
 export async function handleRequest(request: Request, env: Env) {
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: JSON_HEADERS });
@@ -1017,6 +1082,9 @@ export async function handleRequest(request: Request, env: Env) {
 
     if (parts[0] === "threads" && parts[1]) {
       const threadId = parts[1];
+      if (request.method === "GET" && parts[2] === "events" && parts.length === 3) {
+        return await handleThreadEvents(request, env, threadId);
+      }
       if (request.method === "POST" && parts.length === 2) {
         return await handleRegister(request, env, threadId);
       }
