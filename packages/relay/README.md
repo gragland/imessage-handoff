@@ -99,7 +99,7 @@ Then redeploy with `pnpm exec wrangler deploy` and update the Sendblue webhook U
 
 All non-webhook thread APIs use `Authorization: Bearer <token>`. When a user pairs by texting the code, the relay links that token to their phone number.
 
-Inbound iMessage bodies and media URLs live in D1 only while pending. When local Codex claims a reply, the relay returns the content and immediately scrubs it, keeping only a content-free delivery marker for Sendblue retry dedupe. Outbound Codex replies are forwarded to Sendblue and are not stored by the relay.
+Thread metadata, phone bindings, and pairing state live in D1. Inbound iMessage bodies and media URLs live only in the relay Durable Object's in-memory buffer while pending, then are scrubbed when local Codex claims them. Outbound Codex replies are forwarded to Sendblue and are not stored by the relay.
 
 ## Development
 

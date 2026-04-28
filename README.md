@@ -3,7 +3,7 @@
 Remote Control lets you continue a local Codex thread from iMessage. It has two parts:
 
 - `packages/skill`: the installable Codex skill and Stop hook scripts.
-- `packages/relay`: a plain Cloudflare Worker relay with D1 persistence and iMessage transport.
+- `packages/relay`: a plain Cloudflare Worker relay with D1 metadata, a Durable Object message buffer, and iMessage transport.
 
 The hosted relay is the default path. You can also deploy your own relay with Wrangler and point the skill at it.
 
@@ -70,4 +70,4 @@ Keep `~/.codex/skills/remote-control/.state/config.json` private. If that token 
 npx @gaberagland/remote-control install --reset-token
 ```
 
-The relay stores inbound iMessages only until Codex claims them. After claim, the message body and media URLs are deleted. Codex replies are not stored by the relay; they are forwarded to iMessage when the Stop hook publishes them.
+The relay keeps thread, pairing, and phone metadata in D1. Inbound iMessage bodies and media URLs are kept only in the relay Durable Object's in-memory buffer until Codex claims them. Codex replies are not stored by the relay; they are forwarded to iMessage when the Stop hook publishes them.

@@ -50,14 +50,38 @@ interface ReplyMedia {
 
 export class RemoteThreadSocket {
   private readonly state: DurableObjectState;
+  private readonly replies = new Map<string, RemoteReplyRow>();
 
   constructor(state: DurableObjectState) {
     this.state = state;
   }
 
   async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const parts = url.pathname.split("/").filter(Boolean);
+
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-      return error(426, "WebSocket upgrade required.");
+      if (request.method === "GET" && parts[0] === "threads" && parts[1] && parts[2] === "pending" && parts.length === 3) {
+        return json({ replies: eligiblePendingReplies(this.pendingRows(parts[1])).slice(0, 10) });
+      }
+      if (request.method === "POST" && parts[0] === "threads" && parts[1] && parts[2] === "replies" && parts.length === 3) {
+        return await this.handleInsertReply(request, parts[1]);
+      }
+      if (
+        request.method === "POST" &&
+        parts[0] === "threads" &&
+        parts[1] &&
+        parts[2] === "replies" &&
+        parts[3] &&
+        parts[4] === "claim" &&
+        parts.length === 5
+      ) {
+        return this.handleClaimReply(parts[1], parts[3]);
+      }
+      if (request.method === "GET" && parts[0] === "external-replies" && parts[1] && parts.length === 2) {
+        return json({ exists: this.hasExternalReply(parts[1]) });
+      }
+      return error(404, "Not found.");
     }
 
     const pair = new WebSocketPair();
@@ -88,6 +112,74 @@ export class RemoteThreadSocket {
 
   async webSocketClose(ws: WebSocket, code: number, reason: string) {
     ws.close(code, reason);
+  }
+
+  private pendingRows(threadId: string) {
+    return [...this.replies.values()]
+      .filter((reply) => reply.thread_id === threadId && reply.status === "pending")
+      .sort((a, b) => (
+        (a.media_index ?? 0) - (b.media_index ?? 0)
+        || a.created_at.localeCompare(b.created_at)
+        || a.id.localeCompare(b.id)
+      ));
+  }
+
+  private hasExternalReply(externalId: string) {
+    return [...this.replies.values()].some((reply) => reply.external_id === externalId);
+  }
+
+  private async handleInsertReply(request: Request, threadId: string) {
+    const body = await readJsonBody<{
+      body?: unknown;
+      externalId?: unknown;
+      status?: unknown;
+      mediaUrl?: unknown;
+    }>(request);
+    const status = optionalString(body.status) === "applied" ? "applied" : "pending";
+    const externalId = optionalString(body.externalId);
+    const mediaUrl = optionalString(body.mediaUrl);
+    const isTombstone = status === "applied";
+    const id = makeId("reply");
+    const createdAt = nowIso();
+    const { mediaGroupId, mediaIndex } = sendblueMediaGroup(externalId, mediaUrl);
+    this.replies.set(id, {
+      id,
+      thread_id: threadId,
+      external_id: externalId,
+      body: isTombstone ? "" : optionalString(body.body) ?? "",
+      media: isTombstone ? null : replyMediaJson(mediaUrl),
+      media_group_id: mediaGroupId,
+      media_index: mediaIndex,
+      status,
+      created_at: createdAt,
+      applied_at: isTombstone ? createdAt : null,
+    });
+    return json({ id });
+  }
+
+  private handleClaimReply(threadId: string, replyId: string) {
+    const selectedReply = this.replies.get(replyId);
+    if (!selectedReply || selectedReply.thread_id !== threadId || selectedReply.status !== "pending") {
+      return json({ ok: false, error: "Reply is not pending." }, { status: 409 });
+    }
+
+    let replyRows = [selectedReply];
+    if (selectedReply.media_group_id) {
+      replyRows = this.pendingRows(threadId).filter((reply) => reply.media_group_id === selectedReply.media_group_id);
+    }
+    const reply = combineReplyRows(replyRows);
+    const appliedAt = nowIso();
+    for (const row of replyRows) {
+      this.replies.set(row.id, {
+        ...row,
+        status: "applied",
+        body: "",
+        media: null,
+        applied_at: appliedAt,
+      });
+    }
+
+    return json({ ok: true, reply });
   }
 }
 
@@ -295,6 +387,13 @@ async function findPairingThread(env: Env, pairingCode: string) {
 }
 
 async function findExternalReply(env: Env, externalId: string) {
+  if (env.REMOTE_THREAD_SOCKET) {
+    const response = await env.REMOTE_THREAD_SOCKET
+      .get(env.REMOTE_THREAD_SOCKET.idFromName("global"))
+      .fetch(new Request(`https://remote-control.internal/external-replies/${encodeURIComponent(externalId)}`));
+    const body = await response.json() as { exists?: boolean };
+    return body.exists ? { id: externalId } : null;
+  }
   return env.DB.prepare("SELECT id FROM remote_replies WHERE external_id = ?")
     .bind(externalId)
     .first<Pick<RemoteReplyRow, "id">>();
@@ -783,6 +882,11 @@ async function handleStatus(request: Request, env: Env, threadId: string) {
 async function handlePending(request: Request, env: Env, threadId: string) {
   const ownerId = await requireOwnerId(request);
   assertAuthorized(await findThread(env, threadId), ownerId);
+  if (env.REMOTE_THREAD_SOCKET) {
+    return env.REMOTE_THREAD_SOCKET
+      .get(env.REMOTE_THREAD_SOCKET.idFromName("global"))
+      .fetch(new Request(`https://remote-control.internal/threads/${encodeURIComponent(threadId)}/pending`));
+  }
   const { results } = await env.DB.prepare(
     `SELECT *
       FROM remote_replies
@@ -799,6 +903,30 @@ async function handlePending(request: Request, env: Env, threadId: string) {
 async function handleClaim(request: Request, env: Env, threadId: string, replyId: string) {
   const ownerId = await requireOwnerId(request);
   assertAuthorized(await findThread(env, threadId), ownerId);
+  if (env.REMOTE_THREAD_SOCKET) {
+    const claim = await env.REMOTE_THREAD_SOCKET
+      .get(env.REMOTE_THREAD_SOCKET.idFromName("global"))
+      .fetch(new Request(`https://remote-control.internal/threads/${encodeURIComponent(threadId)}/replies/${encodeURIComponent(replyId)}/claim`, {
+        method: "POST",
+      }));
+    if (!claim.ok) {
+      return claim;
+    }
+    const body = await claim.json() as { ok?: boolean; reply?: unknown };
+    const binding = await findPhoneForThread(env, threadId);
+    if (binding) {
+      try {
+        const delayMs = sendblueTypingDelayMs(env);
+        if (delayMs > 0) {
+          await sleep(delayMs);
+        }
+        await sendSendblueTypingIndicator(env, binding.phone_number);
+      } catch (caught) {
+        console.warn("Sendblue typing indicator failed", caught);
+      }
+    }
+    return json(body);
+  }
   const appliedAt = nowIso();
   const selectedReply = await env.DB.prepare(
     "SELECT * FROM remote_replies WHERE id = ? AND thread_id = ? AND status = 'pending'",
@@ -875,6 +1003,21 @@ async function insertRemoteReply(
   status: "pending" | "applied" = "pending",
   mediaUrl: string | null = null,
 ) {
+  if (env.REMOTE_THREAD_SOCKET) {
+    const response = await env.REMOTE_THREAD_SOCKET
+      .get(env.REMOTE_THREAD_SOCKET.idFromName("global"))
+      .fetch(new Request(`https://remote-control.internal/threads/${encodeURIComponent(threadId)}/replies`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ body, externalId, status, mediaUrl }),
+      }));
+    const responseBody = await response.json() as { id?: string };
+    if (!response.ok || !responseBody.id) {
+      throw new Error("Remote relay buffer did not accept reply.");
+    }
+    return responseBody.id;
+  }
+
   const id = makeId("reply");
   const createdAt = nowIso();
   const isTombstone = status === "applied";
@@ -1055,7 +1198,7 @@ async function handleThreadEvents(request: Request, env: Env, threadId: string) 
     return error(500, "Remote thread socket Durable Object is not configured.");
   }
 
-  const id = env.REMOTE_THREAD_SOCKET.idFromName(threadId);
+  const id = env.REMOTE_THREAD_SOCKET.idFromName("global");
   return env.REMOTE_THREAD_SOCKET.get(id).fetch(request);
 }
 

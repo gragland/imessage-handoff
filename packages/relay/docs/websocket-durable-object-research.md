@@ -8,13 +8,13 @@ Using a WebSocket connection from the local Stop hook to a Cloudflare Durable Ob
 
 The important catch is delivery semantics. A pure "do not store inbound messages" design only works when the local Codex Stop hook is connected at the exact moment Sendblue delivers the webhook. If the local machine sleeps, the Stop hook is not currently running, the network drops, Codex is busy responding, or the WebSocket reconnect has not completed yet, the relay has nowhere durable to put the message. The Worker cannot initiate a connection back to the local machine; the local process must already be connected.
 
-Recommended direction: keep the current D1-backed pending reply path as the reliable fallback, and add a Durable Object WebSocket fast path later if latency or polling load becomes a real problem.
+Recommended direction: keep D1 for non-conversation routing metadata such as thread records, phone bindings, and pairing state. Keep conversation-bearing inbound reply bodies/media URLs in the Durable Object's in-memory buffer so both polling and WebSocket delivery avoid persisting user message content.
 
 ## Current Experiment
 
 The relay includes a minimal WebSocket probe at `GET /threads/:threadId/events`.
 
-- The endpoint authenticates the thread, then proxies the WebSocket upgrade to a `RemoteThreadSocket` Durable Object keyed by thread ID.
+- The endpoint authenticates the thread, then proxies the WebSocket upgrade to a single global `RemoteThreadSocket` Durable Object.
 - The local Stop hook opens this socket when it starts waiting for remote input.
 - The Stop hook sends a `stop-hook-connected` probe message.
 - The Durable Object replies with an `ack` message confirming receipt.
@@ -25,15 +25,15 @@ This validates connection setup, upgrade routing, and per-stop teardown without 
 
 ## Current Path
 
-Today, inbound delivery is intentionally durable but short-lived:
+Today, inbound delivery is intentionally short-lived:
 
 1. Sendblue posts to `POST /webhooks/sendblue`.
-2. The Worker authenticates the webhook, finds the active thread, and inserts a pending `remote_replies` row.
+2. The Worker authenticates the webhook, finds the active thread from D1 metadata, and inserts pending reply content into the Durable Object buffer.
 3. The local Stop hook publishes status, then polls `GET /threads/:threadId/pending`.
 4. When a reply appears, the Stop hook claims it with `POST /threads/:threadId/replies/:replyId/claim`.
-5. The Worker returns the content and immediately scrubs body/media from D1, leaving only content-free markers for dedupe.
+5. The Worker returns the content and immediately scrubs body/media from the Durable Object buffer.
 
-This means inbound prompt content is retained only until Codex fetches it, but delivery survives temporary local disconnects.
+This means inbound prompt content is retained only in memory until Codex fetches it. D1 keeps routing metadata, not message bodies/media URLs.
 
 ## Feasibility
 
@@ -55,31 +55,30 @@ On the next assistant stop, the Stop hook can open a fresh WebSocket. Keeping a 
 
 ## Design Options
 
-### Option A: WebSocket Fast Path With D1 Fallback
+### Option A: WebSocket Fast Path With DO Buffer
 
 This is the safest production option.
 
-- Add a Durable Object per owner or per active thread.
+- Use the single relay Durable Object as the pending message buffer.
 - When the Stop hook begins waiting, it opens `wss://.../threads/:threadId/events` with token auth.
-- The Durable Object records the connected socket for that thread.
+- The Durable Object records the connected socket for that thread and/or accepts probe messages.
 - On Sendblue webhook:
   - Keep existing command, pairing, thread-switching, dedupe, and media-group handling.
   - If a matching Stop hook socket is connected, send the reply over WebSocket immediately.
-  - Also preserve or quickly create a D1 fallback row until the local hook acknowledges receipt.
+  - Otherwise keep the pending reply in the Durable Object's in-memory buffer for the polling or next WebSocket wait path.
 - The local hook acknowledges the delivered reply over the WebSocket or via an HTTP claim endpoint.
-- If no socket is connected, keep using the existing pending reply row.
 
 Pros:
 
 - Reduces average delivery latency.
 - Preserves reliable delivery across disconnects.
-- Keeps current privacy posture: content is still scrubbed after claim/ack.
+- Keeps message content out of D1.
 - Allows incremental rollout behind a config flag.
 
 Cons:
 
 - More moving parts: Durable Object binding, WebSocket auth, ack protocol, reconnect handling, and additional tests.
-- Does not remove D1 from the inbound message path.
+- Pending messages can be lost if the Durable Object is evicted/restarted before delivery.
 
 ### Option B: Pure Transient WebSocket Delivery
 
@@ -122,17 +121,17 @@ Cons:
 
 ## Recommendation
 
-Do not replace polling with a pure no-storage WebSocket design for launch. It trades a small amount of short-lived D1 retention for real message loss.
+Do not replace polling with a pure no-buffer WebSocket design for launch. It creates real message loss whenever Codex is not connected.
 
 If polling becomes a real product or cost issue, implement Option A as an incremental fast path:
 
-1. Keep all current HTTP endpoints and D1 semantics.
-2. Add a Durable Object binding and class dedicated to live thread connections.
+1. Keep all current HTTP endpoints.
+2. Keep D1 for thread, phone, and pairing metadata.
 3. Add a Stop hook WebSocket wait path behind config, falling back to current polling on any socket failure.
-4. Add an ack step before scrubbing content or marking a reply delivered.
-5. Keep content-free Sendblue `message_handle` tombstones for retry dedupe.
+4. Store pending inbound bodies/media URLs only in the Durable Object buffer.
+5. Add an ack step before scrubbing content or marking a reply delivered.
 
-This gives the latency benefit without weakening reliability.
+This gives the latency benefit while keeping conversation content out of D1.
 
 ## Open Questions Before Implementation
 

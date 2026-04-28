@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { handleRequest } from "../src/worker.ts";
+import { RemoteThreadSocket, handleRequest } from "../src/worker.ts";
 import type { Env, PhoneBindingRow, RemoteReplyRow, RemoteThreadRow } from "../src/types.ts";
 
 async function ownerIdForToken(token: string) {
@@ -304,6 +304,23 @@ function env() {
   } satisfies Env;
 }
 
+function attachRelayBuffer(testEnv: Env) {
+  const relay = new RemoteThreadSocket({
+    acceptWebSocket() {},
+  } as unknown as DurableObjectState);
+  testEnv.REMOTE_THREAD_SOCKET = {
+    idFromName(name: string) {
+      return { name } as unknown as DurableObjectId;
+    },
+    get(id: DurableObjectId) {
+      return {
+        id,
+        fetch: (request: Request) => relay.fetch(request),
+      } as unknown as DurableObjectStub;
+    },
+  } as unknown as DurableObjectNamespace;
+}
+
 function req(path: string, init: RequestInit = {}) {
   return new Request(`https://remote-control.test${path}`, {
     ...init,
@@ -434,7 +451,7 @@ test("proxies authorized thread websocket upgrades to the Durable Object", async
 
   assert.equal(response.status, 200);
   assert.deepEqual(calls, [{
-    name: threadId,
+    name: "global",
     url: `https://remote-control.test/threads/${threadId}/events?token=dev-token`,
   }]);
 });
@@ -612,6 +629,45 @@ test("subsequent inbound texts from a paired phone enqueue for the active thread
   const body = await json(pending) as { replies: Array<{ body: string }> };
   assert.equal(body.replies.length, 1);
   assert.equal(body.replies[0]?.body, "What is 2 + 2?");
+});
+
+test("relay buffer keeps inbound message content out of D1", async () => {
+  const testEnv = env();
+  attachRelayBuffer(testEnv);
+  const threadId = await register(testEnv);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  await handleRequest(sendblueWebhook(inboundMessage(String(db.threads.get(threadId)?.pairing_code), "pair_msg_1")), testEnv);
+
+  const response = await handleRequest(sendblueWebhook(inboundMessage("What is buffered?", "msg_buffered")), testEnv);
+  assert.equal(response.status, 200);
+  assert.equal([...db.replies.values()].some((reply) => reply.body === "What is buffered?"), false);
+
+  const pending = await handleRequest(req(`/threads/${threadId}/pending`, {
+    headers: { authorization: "Bearer dev-token" },
+  }), testEnv);
+  const body = await json(pending) as { replies: Array<{ id: string; body: string }> };
+  assert.equal(body.replies.length, 1);
+  assert.equal(body.replies[0]?.body, "What is buffered?");
+
+  const replyId = body.replies[0]?.id;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ status: "SENT", message_handle: "typing-1" }), { status: 200 });
+  try {
+    const claim = await handleRequest(req(`/threads/${threadId}/replies/${replyId}/claim`, {
+      method: "POST",
+      headers: { authorization: "Bearer dev-token" },
+    }), testEnv);
+    assert.equal(claim.status, 200);
+    const claimBody = await json(claim) as { reply: { body: string } };
+    assert.equal(claimBody.reply.body, "What is buffered?");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const emptyPending = await handleRequest(req(`/threads/${threadId}/pending`, {
+    headers: { authorization: "Bearer dev-token" },
+  }), testEnv);
+  assert.deepEqual((await json(emptyPending)).replies, []);
 });
 
 test("image-only sendblue webhook creates a pending media reply after quiet window", async () => {
