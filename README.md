@@ -86,4 +86,4 @@ Remote Control is designed to store the minimum data needed to route messages. T
 
 User message content is held only briefly while waiting for local Codex to claim it, then it is scrubbed. Codex replies and generated images are forwarded to Sendblue, our iMessage sending provider, and are not stored by the relay. Aside from this transient relay processing, Sendblue is the only system intended to persist iMessage content.
 
-Cloudflare persisted logging is disabled for the `remote-control` relay. Do not enable Cloudflare logs, log exports, live log tailing, or tracing in production unless the full pipeline is reviewed to make sure message content cannot be captured.
+For added security, Cloudflare persisted logging is disabled for the `remote-control` relay so messages are not stored in Cloudflare logs.
