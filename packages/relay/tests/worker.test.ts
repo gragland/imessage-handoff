@@ -975,6 +975,17 @@ test("bad sendblue webhook secret is rejected", async () => {
   assert.equal(response.status, 401);
 });
 
+test("missing sendblue webhook secret is rejected as misconfigured", async () => {
+  const testEnv: Env = {
+    ...env(),
+    SENDBLUE_WEBHOOK_SECRET: undefined,
+  };
+
+  const response = await handleRequest(sendblueWebhook(inboundMessage("hello")), testEnv);
+  assert.equal(response.status, 500);
+  assert.match(String((await json(response)).error), /webhook secret/i);
+});
+
 test("sendblue webhook ignores outbound non-received and empty events", async () => {
   const testEnv = env();
   const outbound = await handleRequest(sendblueWebhook({ ...inboundMessage("hello"), is_outbound: true }), testEnv);

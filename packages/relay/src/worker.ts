@@ -846,7 +846,10 @@ async function insertRemoteReply(
 
 async function handleSendblueWebhook(request: Request, env: Env) {
   const expectedSecret = env.SENDBLUE_WEBHOOK_SECRET?.trim();
-  if (expectedSecret && request.headers.get("sb-signing-secret") !== expectedSecret) {
+  if (!expectedSecret) {
+    return error(500, "Sendblue webhook secret is not configured.");
+  }
+  if (request.headers.get("sb-signing-secret") !== expectedSecret) {
     return error(401, "Unauthorized.");
   }
 
