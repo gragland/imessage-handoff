@@ -498,6 +498,84 @@ test("relay buffer notifies connected thread websockets when replies arrive", as
   assert.match(message.replyId, /^reply_/);
 });
 
+test("relay buffer sends queued replies to a socket on connect", async () => {
+  const relay = new RemoteThreadSocket({
+    acceptWebSocket() {},
+    getWebSockets() {
+      return [];
+    },
+  } as unknown as DurableObjectState);
+
+  await relay.fetch(new Request("https://remote-control.internal/threads/thread-test-1/replies", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ body: "queued", externalId: "msg_queued", status: "pending" }),
+  }));
+
+  const sent: string[] = [];
+  (relay as unknown as {
+    notifySocketOrScheduleNextPending(threadId: string, socket: { send(message: string): void }): void;
+  }).notifySocketOrScheduleNextPending("thread-test-1", {
+    send(message: string) {
+      sent.push(message);
+    },
+  });
+
+  assert.equal(sent.length, 1);
+  const message = JSON.parse(sent[0] ?? "{}");
+  assert.equal(message.type, "reply-pending");
+  assert.equal(message.threadId, "thread-test-1");
+  assert.match(message.replyId, /^reply_/);
+});
+
+test("relay buffer waits for media group quiet window before websocket notification", async () => {
+  const originalSetTimeout = globalThis.setTimeout;
+  const timers: Array<() => void> = [];
+  globalThis.setTimeout = ((callback: TimerHandler) => {
+    timers.push(callback as () => void);
+    return 1 as unknown as ReturnType<typeof setTimeout>;
+  }) as unknown as typeof setTimeout;
+  const sent: string[] = [];
+  const relay = new RemoteThreadSocket({
+    acceptWebSocket() {},
+    getWebSockets(tag?: string) {
+      assert.equal(tag, "thread-test-1");
+      return [{
+        send(message: string) {
+          sent.push(message);
+        },
+      }];
+    },
+  } as unknown as DurableObjectState);
+
+  try {
+    await relay.fetch(new Request("https://remote-control.internal/threads/thread-test-1/replies", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        body: "inspect",
+        externalId: "media_group_1",
+        status: "pending",
+        mediaUrl: "https://cdn.sendblue.test/one.png",
+      }),
+    }));
+
+    assert.equal(sent.length, 0);
+    assert.equal(timers.length, 1);
+    for (const reply of (relay as unknown as { replies: Map<string, RemoteReplyRow> }).replies.values()) {
+      reply.created_at = "2026-04-25T18:20:00.000Z";
+    }
+    timers[0]?.();
+
+    assert.equal(sent.length, 1);
+    const message = JSON.parse(sent[0] ?? "{}");
+    assert.equal(message.type, "reply-pending");
+    assert.equal(message.threadId, "thread-test-1");
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
 test("pairs a phone by code without enqueueing a pending reply", async () => {
   const testEnv = env();
   const threadId = await register(testEnv, {

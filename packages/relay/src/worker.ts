@@ -88,14 +88,8 @@ export class RemoteThreadSocket {
     const [client, server] = Object.values(pair);
     const threadId = parts[1] ?? "";
     this.state.acceptWebSocket(server, threadId ? [threadId] : undefined);
-    const pending = threadId ? eligiblePendingReplies(this.pendingRows(threadId))[0] : null;
-    if (pending) {
-      server.send(JSON.stringify({
-        type: "reply-pending",
-        threadId,
-        replyId: pending.id,
-        createdAt: pending.createdAt,
-      }));
+    if (threadId) {
+      this.notifySocketOrScheduleNextPending(threadId, server);
     }
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -167,22 +161,62 @@ export class RemoteThreadSocket {
     if (!isTombstone && !mediaGroupId) {
       this.notifyNextPending(threadId);
     } else if (!isTombstone) {
-      setTimeout(() => this.notifyNextPending(threadId), MEDIA_GROUP_QUIET_MS);
+      this.scheduleMediaPendingNotification(threadId);
     }
     return json({ id });
   }
 
   private notifyNextPending(threadId: string) {
-    const pending = eligiblePendingReplies(this.pendingRows(threadId))[0];
-    if (!pending) {
+    const payload = this.nextPendingPayload(threadId);
+    if (!payload) {
       return;
     }
-    this.notifyThread(threadId, {
+    this.notifyThread(threadId, payload);
+  }
+
+  private notifySocketOrScheduleNextPending(threadId: string, socket: WebSocket) {
+    const payload = this.nextPendingPayload(threadId);
+    if (payload) {
+      socket.send(JSON.stringify(payload));
+      return;
+    }
+    this.scheduleMediaPendingNotification(threadId);
+  }
+
+  private nextPendingPayload(threadId: string) {
+    const pending = eligiblePendingReplies(this.pendingRows(threadId))[0];
+    return pending ? {
       type: "reply-pending",
       threadId,
       replyId: pending.id,
       createdAt: pending.createdAt,
+    } : null;
+  }
+
+  private scheduleMediaPendingNotification(threadId: string) {
+    const waitMs = this.nextMediaPendingWaitMs(threadId);
+    if (waitMs === null) {
+      return;
+    }
+    setTimeout(() => this.notifyNextPending(threadId), waitMs);
+  }
+
+  private nextMediaPendingWaitMs(threadId: string) {
+    const grouped = new Map<string, RemoteReplyRow[]>();
+    for (const row of this.pendingRows(threadId)) {
+      if (row.media_group_id) {
+        grouped.set(row.media_group_id, [...(grouped.get(row.media_group_id) ?? []), row]);
+      }
+    }
+    const waits = [...grouped.values()].flatMap((rows) => {
+      const newest = Math.max(...rows.map((row) => Date.parse(row.created_at)).filter(Number.isFinite));
+      if (!Number.isFinite(newest)) {
+        return [];
+      }
+      const waitMs = newest + MEDIA_GROUP_QUIET_MS - Date.now();
+      return waitMs > 0 ? [waitMs] : [];
     });
+    return waits.length > 0 ? Math.max(1, Math.min(...waits)) : null;
   }
 
   private notifyThread(threadId: string, payload: JsonRecord) {
