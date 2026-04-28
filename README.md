@@ -9,14 +9,24 @@ The hosted relay is the default path. You can also deploy your own relay with Wr
 
 ## Install
 
+Current GitHub install, for testing before npm publish:
+
+```bash
+npx github:gragland/remote-control install
+```
+
+After the package is published to npm, the install command will be:
+
 ```bash
 npx @gaberagland/remote-control install
 ```
 
-Until the package is published, install from GitHub:
+Installer options:
 
 ```bash
-npx github:gragland/remote-control install
+npx github:gragland/remote-control install --transport=websocket
+npx github:gragland/remote-control install --relay-url=https://<your-worker-url>
+npx github:gragland/remote-control install --reset-token
 ```
 
 Then open a Codex thread and invoke Remote Control, or say:
@@ -34,7 +44,9 @@ If this is your first time, Codex prints a pairing code. Text that code to the p
 3. When you text the pairing code, the relay links that local token to your phone number.
 4. iMessages from your paired phone become pending replies for the active Codex thread.
 5. The local Stop hook waits via the configured transport, either polling or WebSocket, claims a reply from the relay Durable Object, and continues the original Codex thread.
-6. Codex results are sent back to iMessage.
+6. Codex results are forwarded to iMessage through Sendblue.
+
+Both transports use the same relay Durable Object buffer. Polling checks the buffer over HTTP; WebSocket mode waits for the Durable Object to send a `reply-pending` event, then claims the reply over the same HTTP claim endpoint. Because message bodies are only held in Durable Object memory, pending remote messages can be lost if the Worker/Durable Object is evicted or restarted before Codex claims them.
 
 ## Commands
 
@@ -66,10 +78,10 @@ Remote Control is a relay for prompts into a local Codex thread. The local confi
 Keep `~/.codex/skills/remote-control/.state/config.json` private. If that token leaks, reset the install token and pair your phone again:
 
 ```bash
-npx @gaberagland/remote-control install --reset-token
+npx github:gragland/remote-control install --reset-token
 ```
 
-User message content is never intentionally stored by Remote Control. The only persistent system that stores user messages is the message provider, Sendblue.
+Remote Control's relay never persists user message content. Aside from transient in-memory processing inside the Worker/Durable Object, the only persistent third-party system that stores iMessage content is the message provider, Sendblue.
 
 The relay keeps content-free routing metadata in D1, such as thread records, pairing state, phone bindings, and external message ids for retry dedupe. Inbound iMessage bodies and media URLs live only in the relay Durable Object's in-memory buffer until Codex claims them, then they are scrubbed. Outbound Codex replies and generated image bytes are forwarded directly to Sendblue and are not stored by the relay.
 

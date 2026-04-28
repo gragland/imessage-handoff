@@ -60,8 +60,10 @@ Before starting, you need a Cloudflare account, a Sendblue account with an iMess
 10. Install the skill against your relay.
 
    ```bash
-   npx @gaberagland/remote-control install --relay-url=https://<your-worker-url>
+   npx github:gragland/remote-control install --relay-url=https://<your-worker-url>
    ```
+
+   After the package is published to npm, use `npx @gaberagland/remote-control install --relay-url=https://<your-worker-url>`.
 
 ## Configuration
 
