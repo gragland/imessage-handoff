@@ -29,10 +29,21 @@
       "new_sqlite_classes": ["RemoteThreadSocket"]
     }
   ],
+  "logpush": false,
+  "tail_consumers": [],
+  "streaming_tail_consumers": [],
   "observability": {
     "enabled": false,
     "logs": {
-      "invocation_logs": false
+      "enabled": false,
+      "invocation_logs": false,
+      "persist": false,
+      "destinations": []
+    },
+    "traces": {
+      "enabled": false,
+      "persist": false,
+      "destinations": []
     }
   },
   "vars": {

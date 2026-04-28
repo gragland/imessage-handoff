@@ -69,6 +69,8 @@ Keep `~/.codex/skills/remote-control/.state/config.json` private. If that token 
 npx @gaberagland/remote-control install --reset-token
 ```
 
-The relay keeps thread, pairing, and phone metadata in D1. Inbound iMessage bodies and media URLs are kept only in the relay Durable Object's in-memory buffer until Codex claims them. Codex replies are not stored by the relay; they are forwarded to iMessage when the Stop hook publishes them.
+User message content is never intentionally stored by Remote Control. The only persistent system that stores user messages is the message provider, Sendblue.
 
-The Worker is configured with Cloudflare Workers Observability disabled and invocation logs off. Do not enable Workers Logs, Trace Events Logpush, Tail Workers, or tracing for production unless the log pipeline is explicitly reviewed to guarantee message bodies, media URLs, and provider error payloads are excluded.
+The relay keeps content-free routing metadata in D1, such as thread records, pairing state, phone bindings, and external message ids for retry dedupe. Inbound iMessage bodies and media URLs live only in the relay Durable Object's in-memory buffer until Codex claims them, then they are scrubbed. Outbound Codex replies and generated image bytes are forwarded directly to Sendblue and are not stored by the relay.
+
+The Cloudflare Worker config disables persisted logging for this app only: Workers Observability is off, invocation logs are off, Workers Trace Events Logpush is off, Tail Worker consumers are empty, Streaming Tail Worker consumers are empty, and trace persistence is off in `packages/relay/wrangler.jsonc` for the `remote-control` Worker. Do not enable Workers Logs, Trace Events Logpush, Tail Workers, Streaming Tail Workers, or tracing for production unless the full log pipeline is reviewed to guarantee message bodies, media URLs, generated image bytes, and provider error payloads are excluded.

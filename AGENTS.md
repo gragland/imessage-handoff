@@ -24,7 +24,7 @@ This is the standalone Remote Control repo, intended to become public before lau
 - Keep this repo free of private monorepo dependencies such as `@vibe/ui`.
 - Token identity is client-token-only. Do not add a Codex account id or local `userId` back unless the product design changes.
 - The relay intentionally does not persist prompt content: inbound iMessage body/media is held in the relay Durable Object's in-memory buffer and scrubbed when Codex claims it, while D1 is for metadata such as phone bindings, pairing, and thread state. Outbound Codex replies are forwarded to Sendblue without storing the content.
-- Keep Cloudflare Workers Observability, Trace Events Logpush, Tail Workers, and tracing disabled for production unless the full log pipeline is reviewed first. Relay warnings must not include request bodies, message text, media URLs, or upstream provider response bodies.
+- Keep Cloudflare Workers Observability, Trace Events Logpush, Tail Workers, Streaming Tail Workers, and tracing disabled for production unless the full log pipeline is reviewed first. These settings must remain app-scoped in `packages/relay/wrangler.jsonc`. Relay warnings must not include request bodies, message text, media URLs, generated image bytes, or upstream provider response bodies.
 - `list` is still accepted as an undocumented compatibility alias for the documented iMessage `threads` command. Do not document `list` unless product copy changes.
 - Record future import/deploy gotchas here as they are discovered.
 

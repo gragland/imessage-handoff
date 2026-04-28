@@ -101,7 +101,7 @@ All non-webhook thread APIs use `Authorization: Bearer <token>`. When a user pai
 
 Thread metadata, phone bindings, and pairing state live in D1. Inbound iMessage bodies and media URLs live only in the relay Durable Object's in-memory buffer while pending, then are scrubbed when local Codex claims them. Outbound Codex replies are forwarded to Sendblue and are not stored by the relay.
 
-Cloudflare Workers Observability is disabled in `wrangler.jsonc`, with invocation logs explicitly disabled. Keep Workers Logs, Workers Trace Events Logpush, Tail Workers, and tracing off in production unless the full log pipeline is reviewed first. Message bodies are never placed in URLs, and relay warnings intentionally avoid logging Sendblue response payloads because provider error payloads could echo message content.
+Cloudflare persisted logging is disabled in this app's `wrangler.jsonc`: Workers Observability is off, invocation logs are off, Workers Trace Events Logpush is off, Tail Worker consumers are empty, Streaming Tail Worker consumers are empty, and trace persistence is off for the `remote-control` Worker. Keep Workers Logs, Workers Trace Events Logpush, Tail Workers, Streaming Tail Workers, and tracing off in production unless the full log pipeline is reviewed first. Message bodies are never placed in URLs, and relay warnings intentionally avoid logging Sendblue response payloads because provider error payloads could echo message content.
 
 ## Development
 
