@@ -28,7 +28,7 @@ If this is your first time, Codex prints a pairing code. Text that code to the S
 3. When you text the pairing code, the relay links that local token to your phone number.
 4. Sendblue webhooks turn iMessages from your paired phone into pending replies for the active Codex thread.
 5. The local Stop hook long-polls the relay, claims a reply, and continues the original Codex thread.
-6. Codex results, including generated images, are sent directly through Sendblue.
+6. Codex results are sent directly through Sendblue.
 
 ## Commands
 
