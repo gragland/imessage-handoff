@@ -20,8 +20,8 @@ function HomePage() {
           public GitHub repo.
         </p>
         <div className="links" aria-label="Remote Control links">
-          <a href="https://github.com/gaberagland/remote-control">GitHub</a>
-          <a href="https://github.com/gaberagland/remote-control/tree/main/packages/relay#self-hosting">
+          <a href="https://github.com/gragland/remote-control">GitHub</a>
+          <a href="https://github.com/gragland/remote-control/tree/main/packages/relay#self-hosting">
             Self-hosting
           </a>
         </div>
