@@ -158,10 +158,6 @@ function publicThread(thread: RemoteThreadRow, pendingReplies: Array<Pick<Remote
     status: thread.status,
     remoteEnabled: thread.remote_enabled === 1,
     pairingCode: thread.pairing_code,
-    lastAssistantMessage: thread.last_assistant_message,
-    lastNotificationMessageHandle: thread.last_notification_message_handle,
-    lastNotificationStatus: thread.last_notification_status,
-    lastNotificationError: thread.last_notification_error,
     lastStopAt: thread.last_stop_at,
     createdAt: thread.created_at,
     updatedAt: thread.updated_at,
@@ -191,10 +187,9 @@ async function handleRegister(request: Request, env: Env, threadId: string) {
 
   await env.DB.prepare(
     `INSERT INTO remote_threads (
-      id, owner_id, cwd, title, handoff_summary, status, remote_enabled, pairing_code, last_assistant_message,
-      last_notification_message_handle, last_notification_status, last_notification_error,
+      id, owner_id, cwd, title, handoff_summary, status, remote_enabled, pairing_code,
       last_stop_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, 'enabled', 1, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, 'enabled', 1, ?, NULL, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       owner_id = excluded.owner_id,
       cwd = excluded.cwd,
@@ -700,11 +695,10 @@ async function handleStatus(request: Request, env: Env, threadId: string) {
     `UPDATE remote_threads
       SET cwd = ?,
           status = ?,
-          last_assistant_message = ?,
           last_stop_at = ?,
           updated_at = ?
       WHERE id = ?`,
-  ).bind(cwd, status, lastAssistantMessage, lastStopAt, updatedAt, threadId).run();
+  ).bind(cwd, status, lastStopAt, updatedAt, threadId).run();
 
   if (lastAssistantMessage || generatedImages.length > 0) {
     const binding = await findPhoneForThread(env, threadId);
@@ -717,14 +711,6 @@ async function handleStatus(request: Request, env: Env, threadId: string) {
             status: sendResult.status,
             messageHandle: sendResult.messageHandle,
           };
-          await env.DB.prepare(
-            `UPDATE remote_threads
-              SET last_notification_message_handle = ?,
-                  last_notification_status = ?,
-                  last_notification_error = NULL,
-                  updated_at = ?
-              WHERE id = ?`,
-          ).bind(sendResult.messageHandle, sendResult.status, nowIso(), threadId).run();
         }
       } catch (caught) {
         const errorMessage = caught instanceof Error ? caught.message : String(caught);
@@ -734,14 +720,6 @@ async function handleStatus(request: Request, env: Env, threadId: string) {
           error: errorMessage,
         };
         console.warn("Sendblue status notification failed", caught);
-        await env.DB.prepare(
-          `UPDATE remote_threads
-            SET last_notification_status = 'ERROR',
-                last_notification_message_handle = NULL,
-                last_notification_error = ?,
-                updated_at = ?
-            WHERE id = ?`,
-        ).bind(errorMessage, nowIso(), threadId).run();
         // Remote status publishing should never break the local Stop hook.
       }
     } else {
@@ -774,7 +752,7 @@ async function handlePending(request: Request, env: Env, threadId: string) {
 async function handleClaim(request: Request, env: Env, threadId: string, replyId: string) {
   const ownerId = await requireOwnerId(request);
   assertAuthorized(await findThread(env, threadId), ownerId);
-  const claimedAt = nowIso();
+  const appliedAt = nowIso();
   const selectedReply = await env.DB.prepare(
     "SELECT * FROM remote_replies WHERE id = ? AND thread_id = ? AND status = 'pending'",
   ).bind(replyId, threadId).first<RemoteReplyRow>();
@@ -784,6 +762,7 @@ async function handleClaim(request: Request, env: Env, threadId: string, replyId
   }
 
   let replyRows = [selectedReply];
+  let reply = combineReplyRows(replyRows);
   let result: D1Result;
 
   if (selectedReply.media_group_id) {
@@ -794,17 +773,28 @@ async function handleClaim(request: Request, env: Env, threadId: string, replyId
         ORDER BY media_index ASC, created_at ASC`,
     ).bind(threadId, selectedReply.media_group_id).all<RemoteReplyRow>();
     replyRows = results;
+    reply = combineReplyRows(replyRows);
+    // Preserve the external Sendblue ids for retry dedupe, but scrub message
+    // contents as soon as local Codex has fetched them.
     result = await env.DB.prepare(
       `UPDATE remote_replies
-        SET status = 'claimed', claimed_at = ?
+        SET status = 'applied',
+            body = '',
+            media = NULL,
+            applied_at = ?
         WHERE thread_id = ? AND media_group_id = ? AND status = 'pending'`,
-    ).bind(claimedAt, threadId, selectedReply.media_group_id).run();
+    ).bind(appliedAt, threadId, selectedReply.media_group_id).run();
   } else {
+    // Preserve the external Sendblue id for retry dedupe, but scrub message
+    // contents as soon as local Codex has fetched it.
     result = await env.DB.prepare(
       `UPDATE remote_replies
-        SET status = 'claimed', claimed_at = ?
+        SET status = 'applied',
+            body = '',
+            media = NULL,
+            applied_at = ?
         WHERE id = ? AND thread_id = ? AND status = 'pending'`,
-    ).bind(claimedAt, replyId, threadId).run();
+    ).bind(appliedAt, replyId, threadId).run();
   }
 
   if (!result.meta || result.meta.changes < 1) {
@@ -826,7 +816,7 @@ async function handleClaim(request: Request, env: Env, threadId: string, replyId
 
   return json({
     ok: true,
-    reply: combineReplyRows(replyRows),
+    reply,
   });
 }
 
@@ -840,13 +830,17 @@ async function insertRemoteReply(
 ) {
   const id = makeId("reply");
   const createdAt = nowIso();
-  const media = replyMediaJson(mediaUrl);
+  const isTombstone = status === "applied";
+  // Control messages such as pairing/list/switch only need an external-id
+  // tombstone for dedupe; their content is not retained.
+  const storedBody = isTombstone ? "" : body;
+  const media = isTombstone ? null : replyMediaJson(mediaUrl);
   const { mediaGroupId, mediaIndex } = sendblueMediaGroup(externalId, mediaUrl);
   await env.DB.prepare(
     `INSERT INTO remote_replies (
-      id, thread_id, external_id, body, media, media_group_id, media_index, status, created_at, claimed_at, applied_at, failed_at, error
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL)`,
-  ).bind(id, threadId, externalId, body, media, mediaGroupId, mediaIndex, status, createdAt, status === "applied" ? createdAt : null).run();
+      id, thread_id, external_id, body, media, media_group_id, media_index, status, created_at, applied_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(id, threadId, externalId, storedBody, media, mediaGroupId, mediaIndex, status, createdAt, isTombstone ? createdAt : null).run();
   return id;
 }
 

@@ -7,10 +7,6 @@ CREATE TABLE IF NOT EXISTS remote_threads (
   status TEXT NOT NULL DEFAULT 'enabled',
   remote_enabled INTEGER NOT NULL DEFAULT 1,
   pairing_code TEXT,
-  last_assistant_message TEXT,
-  last_notification_message_handle TEXT,
-  last_notification_status TEXT,
-  last_notification_error TEXT,
   last_stop_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -30,12 +26,9 @@ CREATE TABLE IF NOT EXISTS remote_replies (
   media TEXT,
   media_group_id TEXT,
   media_index INTEGER,
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'claimed', 'applied', 'failed')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied')),
   created_at TEXT NOT NULL,
-  claimed_at TEXT,
-  applied_at TEXT,
-  failed_at TEXT,
-  error TEXT
+  applied_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS remote_replies_pending_idx

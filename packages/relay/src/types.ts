@@ -8,7 +8,7 @@ export interface Env {
   SENDBLUE_TYPING_DELAY_MS?: string;
 }
 
-export type RemoteReplyStatus = "pending" | "claimed" | "applied" | "failed";
+export type RemoteReplyStatus = "pending" | "applied";
 
 export interface RemoteThreadRow {
   id: string;
@@ -19,10 +19,6 @@ export interface RemoteThreadRow {
   status: string;
   remote_enabled: number;
   pairing_code: string | null;
-  last_assistant_message: string | null;
-  last_notification_message_handle: string | null;
-  last_notification_status: string | null;
-  last_notification_error: string | null;
   last_stop_at: string | null;
   created_at: string;
   updated_at: string;
@@ -38,10 +34,7 @@ export interface RemoteReplyRow {
   media_index: number | null;
   status: RemoteReplyStatus;
   created_at: string;
-  claimed_at: string | null;
   applied_at: string | null;
-  failed_at: string | null;
-  error: string | null;
 }
 
 export interface PhoneBindingRow {

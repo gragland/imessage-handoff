@@ -60,10 +60,6 @@ class FakeD1Database {
         status: "enabled",
         remote_enabled: 1,
         pairing_code: pairingCode,
-        last_assistant_message: existing?.last_assistant_message ?? null,
-        last_notification_message_handle: existing?.last_notification_message_handle ?? null,
-        last_notification_status: existing?.last_notification_status ?? null,
-        last_notification_error: existing?.last_notification_error ?? null,
         last_stop_at: existing?.last_stop_at ?? null,
         created_at: existing?.created_at ?? createdAt,
         updated_at: updatedAt,
@@ -79,32 +75,6 @@ class FakeD1Database {
           binding.updated_at = updatedAt;
         }
       }
-      return { meta: { changes: 1 } };
-    }
-
-    if (sql.includes("UPDATE remote_threads") && sql.includes("last_notification_message_handle = ?")) {
-      const [messageHandle, status, updatedAt, id] = values as string[];
-      const thread = this.threads.get(id);
-      if (!thread) {
-        return { meta: { changes: 0 } };
-      }
-      thread.last_notification_message_handle = messageHandle;
-      thread.last_notification_status = status;
-      thread.last_notification_error = null;
-      thread.updated_at = updatedAt;
-      return { meta: { changes: 1 } };
-    }
-
-    if (sql.includes("UPDATE remote_threads") && sql.includes("last_notification_status = 'ERROR'")) {
-      const [error, updatedAt, id] = values as string[];
-      const thread = this.threads.get(id);
-      if (!thread) {
-        return { meta: { changes: 0 } };
-      }
-      thread.last_notification_status = "ERROR";
-      thread.last_notification_message_handle = null;
-      thread.last_notification_error = error;
-      thread.updated_at = updatedAt;
       return { meta: { changes: 1 } };
     }
 
@@ -153,14 +123,13 @@ class FakeD1Database {
     }
 
     if (sql.includes("UPDATE remote_threads")) {
-      const [cwd, status, lastAssistantMessage, lastStopAt, updatedAt, id] = values as Array<string | null>;
+      const [cwd, status, lastStopAt, updatedAt, id] = values as Array<string | null>;
       const thread = this.threads.get(String(id));
       if (!thread) {
         return { meta: { changes: 0 } };
       }
       thread.cwd = String(cwd);
       thread.status = String(status);
-      thread.last_assistant_message = lastAssistantMessage;
       thread.last_stop_at = String(lastStopAt);
       thread.updated_at = String(updatedAt);
       return { meta: { changes: 1 } };
@@ -178,10 +147,7 @@ class FakeD1Database {
         media_index: mediaIndex === null ? null : Number(mediaIndex),
         status: status as RemoteReplyRow["status"],
         created_at: String(createdAt),
-        claimed_at: null,
         applied_at: appliedAt === null ? null : String(appliedAt),
-        failed_at: null,
-        error: null,
       });
       return { meta: { changes: 1 } };
     }
@@ -215,12 +181,14 @@ class FakeD1Database {
     }
 
     if (sql.includes("UPDATE remote_replies") && sql.includes("media_group_id = ?")) {
-      const [claimedAt, threadId, mediaGroupId] = values as string[];
+      const [appliedAt, threadId, mediaGroupId] = values as string[];
       let changes = 0;
       for (const reply of this.replies.values()) {
         if (reply.thread_id === threadId && reply.media_group_id === mediaGroupId && reply.status === "pending") {
-          reply.status = "claimed";
-          reply.claimed_at = claimedAt;
+          reply.status = "applied";
+          reply.body = "";
+          reply.media = null;
+          reply.applied_at = appliedAt;
           changes += 1;
         }
       }
@@ -228,13 +196,15 @@ class FakeD1Database {
     }
 
     if (sql.includes("UPDATE remote_replies")) {
-      const [claimedAt, id, threadId] = values as string[];
+      const [appliedAt, id, threadId] = values as string[];
       const reply = this.replies.get(id);
       if (!reply || reply.thread_id !== threadId || reply.status !== "pending") {
         return { meta: { changes: 0 } };
       }
-      reply.status = "claimed";
-      reply.claimed_at = claimedAt;
+      reply.status = "applied";
+      reply.body = "";
+      reply.media = null;
+      reply.applied_at = appliedAt;
       return { meta: { changes: 1 } };
     }
 
@@ -346,6 +316,10 @@ function req(path: string, init: RequestInit = {}) {
 
 async function json(response: Response) {
   return response.json() as Promise<Record<string, unknown>>;
+}
+
+async function notification(response: Response) {
+  return (await json(response)).notification as Record<string, unknown>;
 }
 
 async function register(testEnv: Env, overrides: Record<string, unknown> = {}) {
@@ -683,7 +657,11 @@ test("multi-image sendblue webhooks claim as one grouped reply after quiet windo
       { url: "https://cdn.example.test/one.png" },
       { url: "https://cdn.example.test/two.png" },
     ]);
-    assert.equal([...db.replies.values()].filter((reply) => reply.status === "claimed").length, 2);
+    const tombstones = [...db.replies.values()].filter((reply) => reply.media_group_id === "group");
+    assert.deepEqual(tombstones.map((reply) => ({ status: reply.status, body: reply.body, media: reply.media })), [
+      { status: "applied", body: "", media: null },
+      { status: "applied", body: "", media: null },
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1091,7 +1069,7 @@ test("publishes status and shows debug thread state", async () => {
   }), testEnv);
   const body = await json(debug);
   assert.equal(body.id, threadId);
-  assert.equal(body.lastAssistantMessage, "Done.");
+  assert.equal(body.lastAssistantMessage, undefined);
   assert.equal(body.lastStopAt, "2026-04-25T18:25:00.000Z");
 });
 
@@ -1145,7 +1123,7 @@ test("publishes every non-empty status to sendblue", async () => {
       from_number: "+16452468235",
       content: "Created TEMP.",
     });
-    assert.equal(db.threads.get(threadId)?.last_notification_message_handle, "message-2");
+    assert.equal((await notification(duplicate)).messageHandle, "message-2");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1185,7 +1163,6 @@ test("publishes each changed assistant message", async () => {
     }
 
     assert.deepEqual(calls.map((call) => call.content), ["81", "Created TEMP."]);
-    assert.equal(db.threads.get(threadId)?.last_notification_message_handle, "message-2");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1240,7 +1217,7 @@ test("uploads one generated image and sends it with send-message", async () => {
         },
       },
     ]);
-    assert.equal(db.threads.get(threadId)?.last_notification_message_handle, "message-1");
+    assert.equal((await notification(status)).messageHandle, "message-1");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1349,7 +1326,7 @@ test("uploads multiple generated images and sends one carousel", async () => {
         "https://cdn.sendblue.test/image-2.png",
       ],
     });
-    assert.equal(db.threads.get(threadId)?.last_notification_message_handle, "carousel-1");
+    assert.equal((await notification(status)).messageHandle, "carousel-1");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1405,7 +1382,7 @@ test("sends text before carousel for text plus multiple images", async () => {
       from_number: "+16452468235",
       content: "Two cow options.",
     });
-    assert.equal(db.threads.get(threadId)?.last_notification_message_handle, "carousel-1");
+    assert.equal((await notification(status)).messageHandle, "carousel-1");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1439,9 +1416,7 @@ test("sendblue media failure does not fail status publish", async () => {
       }),
     }), testEnv);
     assert.equal(status.status, 200);
-    assert.equal(db.threads.get(threadId)?.last_notification_message_handle, null);
-    assert.equal(db.threads.get(threadId)?.last_notification_status, "ERROR");
-    assert.match(String(db.threads.get(threadId)?.last_notification_error), /Sendblue media API 500/);
+    assert.match(String((await notification(status)).error), /Sendblue media API 500/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1473,14 +1448,13 @@ test("sendblue failure does not fail status publish", async () => {
       }),
     }), testEnv);
     assert.equal(status.status, 200);
-    assert.equal(db.threads.get(threadId)?.last_notification_message_handle, null);
-    assert.equal(db.threads.get(threadId)?.last_notification_status, "ERROR");
+    assert.equal((await notification(status)).status, "ERROR");
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test("sendblue error body does not mark a turn notified", async () => {
+test("sendblue error body is returned without failing status publish", async () => {
   const testEnv = env();
   const threadId = await register(testEnv);
   const db = testEnv.DB as unknown as FakeD1Database;
@@ -1511,14 +1485,13 @@ test("sendblue error body does not mark a turn notified", async () => {
       }),
     }), testEnv);
     assert.equal(status.status, 200);
-    assert.equal(db.threads.get(threadId)?.last_notification_message_handle, null);
-    assert.equal(db.threads.get(threadId)?.last_notification_status, "ERROR");
+    assert.equal((await notification(status)).status, "ERROR");
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test("sendblue response without a message handle stores notification error", async () => {
+test("sendblue response without a message handle returns notification error", async () => {
   const testEnv = env();
   const threadId = await register(testEnv);
   const db = testEnv.DB as unknown as FakeD1Database;
@@ -1544,8 +1517,7 @@ test("sendblue response without a message handle stores notification error", asy
       }),
     }), testEnv);
     assert.equal(status.status, 200);
-    assert.equal(db.threads.get(threadId)?.last_notification_message_handle, null);
-    assert.equal(db.threads.get(threadId)?.last_notification_status, "ERROR");
+    assert.equal((await notification(status)).status, "ERROR");
   } finally {
     globalThis.fetch = originalFetch;
   }

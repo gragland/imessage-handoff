@@ -77,7 +77,7 @@ Then redeploy and update the Sendblue webhook URL to the custom domain.
 
 - `POST /installations`: returns a local install token.
 - `POST /threads/:threadId`: registers or re-enables a Codex thread.
-- `POST /threads/:threadId/status`: publishes Codex output and generated images.
+- `POST /threads/:threadId/status`: forwards Codex output and generated images to iMessage without storing the outbound content.
 - `GET /threads/:threadId/pending`: lists claimable remote replies.
 - `POST /threads/:threadId/replies/:replyId/claim`: claims one reply or media group.
 - `GET /threads/:threadId`: debug thread state.
@@ -85,6 +85,8 @@ Then redeploy and update the Sendblue webhook URL to the custom domain.
 - `POST /webhooks/sendblue`: receives Sendblue inbound events.
 
 All non-webhook thread APIs use `Authorization: Bearer <token>`. When a user pairs by texting the code, the relay links that token to their phone number.
+
+Inbound iMessage bodies and media URLs live in D1 only while pending. When local Codex claims a reply, the relay returns the content and immediately scrubs it, keeping only a content-free delivery marker for Sendblue retry dedupe. Outbound Codex replies are forwarded to Sendblue and are not stored by the relay.
 
 ## Development
 

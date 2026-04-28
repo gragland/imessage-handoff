@@ -28,7 +28,7 @@ If this is your first time, Codex prints a pairing code. Text that code to the S
 3. When you text the pairing code, the relay links that local token to your phone number.
 4. Sendblue webhooks turn iMessages from your paired phone into pending replies for the active Codex thread.
 5. The local Stop hook long-polls the relay, claims a reply, and continues the original Codex thread.
-6. Codex results, including generated images, are sent back through Sendblue.
+6. Codex results, including generated images, are sent directly through Sendblue.
 
 ## Commands
 
@@ -57,3 +57,5 @@ See [packages/relay/README.md](packages/relay/README.md) for Wrangler deployment
 Remote Control is a relay for prompts into a local Codex thread. The local config contains the token that gets linked to your phone number when you pair with iMessage.
 
 Keep `~/.codex/skills/remote-control/.state/config.json` private. If that token leaks, reset the install token and pair your phone again.
+
+The relay stores inbound iMessages only until Codex claims them. After claim, the relay keeps a content-free delivery marker so Sendblue retries do not duplicate work, but the message body and media URLs are deleted. Codex replies are not stored by the relay; they are forwarded to iMessage when the Stop hook publishes them.
