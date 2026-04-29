@@ -15,7 +15,7 @@ Install the skill with the Skills CLI:
 npx skills add https://github.com/gragland/remote-control --skill remote-control
 ```
 
-From a local checkout, useful while the repo is private:
+From a local checkout:
 
 ```bash
 npx skills add . --skill remote-control

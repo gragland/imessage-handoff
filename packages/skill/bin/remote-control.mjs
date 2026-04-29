@@ -189,7 +189,7 @@ function uninstallStopHook(hooksPath) {
 }
 
 async function install() {
-  // The installer is intentionally close to the eventual public npm flow. It
+  // The installer is intentionally close to the public npx-from-GitHub flow. It
   // fetches/reuses a token, copies the skill, writes config, and registers hooks.
   const codexHome = readArg("codex-home") || process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
   const skillTargetDir = path.join(codexHome, "skills", "remote-control");

@@ -18,7 +18,7 @@ This is the standalone Remote Control repo, intended to become public before lau
 
 ## Gotchas
 
-- The README install command `npx @gaberagland/remote-control install` is the intended public path after the skill package is published to npm. Until then, `npx github:gragland/remote-control install` should exercise the repo through a similar npx flow.
+- The README install path is `npx skills add https://github.com/gragland/remote-control --skill remote-control`. Runtime setup and config changes should happen through natural-language skill commands where possible.
 - The installer default relay is still a temporary hosted workers.dev URL until a final product domain is chosen.
 - Sendblue API calls should use `api.sendblue.com`, not the older `.co` host.
 - Keep this repo free of private monorepo dependencies such as `@vibe/ui`.
