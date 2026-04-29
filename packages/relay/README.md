@@ -63,7 +63,7 @@ Before starting, you need a Cloudflare account, a Sendblue account with an iMess
    npx skills add https://github.com/gragland/remote-control --skill remote-control
    ```
 
-   Then ask Codex: `Remote Control, use my self-hosted relay at https://<your-worker-url>.`
+   Then ask Codex: `Remote Control use my self-hosted relay at https://<your-worker-url>.`
 
 ## Configuration
 

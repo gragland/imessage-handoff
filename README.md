@@ -23,7 +23,7 @@ npx skills add . --skill remote-control
 
 The first `start remote` run completes setup automatically by creating the local relay config and installing the Codex Stop hook. Add `--global` if you want the skill available outside the current project.
 
-After installing, open a Codex thread and invoke Remote Control, or say:
+After installing, open a Codex thread and say:
 
 ```text
 start remote
@@ -36,16 +36,16 @@ If this is your first time, Codex prints a pairing code. Text that code to the p
 Configure Remote Control by asking the skill in Codex:
 
 ```text
-Remote Control, show my config.
-Remote Control, use my self-hosted relay at https://<your-worker-url>.
-Remote Control, switch back to the hosted relay.
-Remote Control, reset my install token.
-Remote Control, uninstall yourself.
+Remote Control show my config.
+Remote Control use my self-hosted relay at https://<your-worker-url>.
+Remote Control switch back to the hosted relay.
+Remote Control reset my install token.
+Remote Control uninstall yourself.
 ```
 
 ## Uninstall
 
-Ask `Remote Control, uninstall yourself.` This removes the Codex Stop hook used for communication with the relay. You can then disable or remove the skill in Codex settings.
+Ask `Remote Control uninstall yourself.` This removes the Codex Stop hook used for communication with the relay. You can then disable or remove the skill in Codex settings.
 
 ## How It Works
 
@@ -86,7 +86,7 @@ Remote Control is a relay for prompts into a local Codex thread. The local confi
 Keep `~/.codex/skills/remote-control/.state/config.json` private. If that token leaks, reset the install token and pair your phone again:
 
 ```text
-Remote Control, reset my install token.
+Remote Control reset my install token.
 ```
 
 Remote Control is designed to store the minimum data needed to route messages. The relay avoids persisting conversation content, avoids logging message details, and stores only routing metadata such as thread state, pairing state, and phone bindings.
