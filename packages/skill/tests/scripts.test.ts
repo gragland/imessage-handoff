@@ -219,7 +219,7 @@ test("start-remote bootstraps config and Stop hook on first invoke", async () =>
 
   const config = JSON.parse(readFileSync(path.join(stateDir, "config.json"), "utf8"));
   assert.equal(config.token, "dev-token");
-  assert.equal(config.transport, "websocket");
+  assert.equal(config.stopWaitSeconds, 86400);
   assert.match(config.apiBaseUrl, /^https:\/\/remote-control\.gabe-ragland\.workers\.dev$/);
 
   const codexConfig = readFileSync(path.join(codexHome, "config.toml"), "utf8");
@@ -461,14 +461,12 @@ test("publish-stop exits immediately without active thread", async () => {
 test("publish-stop exits quietly after status when no remote reply is pending", async () => {
   const mockPath = mockFile({
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
-    "GET /threads/codex-thread-1/pending": { body: { replies: [] } },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
   writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({
     apiBaseUrl: "https://example.test",
     token: "dev-token",
-    stopPollSeconds: 0,
-    transport: "poll",
+    stopWaitSeconds: 0,
   }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
@@ -494,9 +492,10 @@ test("publish-stop exits quietly after status when no remote reply is pending", 
   const mock = JSON.parse(readFileSync(mockPath, "utf8"));
   assert.deepEqual(mock.calls.map((call: { method: string; path: string }) => `${call.method} ${call.path}`), [
     "POST /threads/codex-thread-1/status",
-    "GET /threads/codex-thread-1/pending",
   ]);
-  assert.deepEqual(mock.websocketCalls ?? [], []);
+  assert.deepEqual(mock.websocketCalls.map((call: { method: string; path: string }) => `${call.method} ${call.path}`), [
+    "WS /threads/codex-thread-1/events",
+  ]);
   const active = JSON.parse(readFileSync(path.join(stateDir, "active-threads.json"), "utf8"));
   assert.equal(active.threads["codex-thread-1"].lastStopAt !== null, true);
 });
@@ -515,14 +514,12 @@ test("publish-stop ignores session-log local messages unless a local follow-up i
   ]);
   const mockPath = mockFile({
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
-    "GET /threads/codex-thread-1/pending": { body: { replies: [] } },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
   writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({
     apiBaseUrl: "https://example.test",
     token: "dev-token",
-    stopPollSeconds: 0,
-    transport: "poll",
+    stopWaitSeconds: 0,
   }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
@@ -549,7 +546,6 @@ test("publish-stop ignores session-log local messages unless a local follow-up i
   const mock = JSON.parse(readFileSync(mockPath, "utf8"));
   assert.deepEqual(mock.calls.map((call: { method: string; path: string }) => `${call.method} ${call.path}`), [
     "POST /threads/codex-thread-1/status",
-    "GET /threads/codex-thread-1/pending",
   ]);
   const active = JSON.parse(readFileSync(path.join(stateDir, "active-threads.json"), "utf8"));
   assert.equal(Boolean(active.threads["codex-thread-1"]), true);
@@ -558,7 +554,6 @@ test("publish-stop ignores session-log local messages unless a local follow-up i
 test("publish-stop disables remote and blocks with a local takeover note", async () => {
   const mockPath = mockFile({
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
-    "GET /threads/codex-thread-1/pending": { body: { replies: [] } },
     "POST /threads/codex-thread-1/stop": { body: { ok: true } },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
@@ -566,9 +561,7 @@ test("publish-stop disables remote and blocks with a local takeover note", async
   writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({
     apiBaseUrl: "https://example.test",
     token: "dev-token",
-    stopPollSeconds: 3,
-    transport: "poll",
-    stopPollIntervalSeconds: 1,
+    stopWaitSeconds: 3,
   }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
@@ -626,23 +619,20 @@ test("publish-stop disables remote and blocks with a local takeover note", async
 test("publish-stop claims a remote reply and emits a block decision", async () => {
   const mockPath = mockFile({
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
-    "GET /threads/codex-thread-1/pending": {
-      body: {
-        replies: [
-          { id: "reply_1", body: "What is 2 + 2?", createdAt: "2026-04-25T18:30:00.000Z" },
-        ],
-      },
-    },
     "POST /threads/codex-thread-1/replies/reply_1/claim": {
       body: { ok: true, reply: { id: "reply_1", body: "What is 2 + 2?" } },
     },
   });
+  const mock = JSON.parse(readFileSync(mockPath, "utf8"));
+  mock.websocketEvents = {
+    "/threads/codex-thread-1/events": [{ type: "reply-pending", replyId: "reply_1" }],
+  };
+  writeFileSync(mockPath, JSON.stringify(mock));
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
   writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({
     apiBaseUrl: "https://example.test",
     token: "dev-token",
-    stopPollSeconds: 0,
-    transport: "poll",
+    stopWaitSeconds: 0,
   }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
@@ -672,16 +662,15 @@ test("publish-stop claims a remote reply and emits a block decision", async () =
   assert.doesNotMatch(parsed.reason, /empty response/);
   assert.doesNotMatch(parsed.reason, /connectivity test/);
   assert.doesNotMatch(parsed.reason, /claimed reply/i);
-  const mock = JSON.parse(readFileSync(mockPath, "utf8"));
-  assert.deepEqual(mock.calls.map((call: { method: string; path: string }) => `${call.method} ${call.path}`), [
+  const updatedMock = JSON.parse(readFileSync(mockPath, "utf8"));
+  assert.deepEqual(updatedMock.calls.map((call: { method: string; path: string }) => `${call.method} ${call.path}`), [
     "POST /threads/codex-thread-1/status",
-    "GET /threads/codex-thread-1/pending",
     "POST /threads/codex-thread-1/replies/reply_1/claim",
   ]);
-  assert.equal(mock.calls[2].body, null);
+  assert.equal(updatedMock.calls[1].body, null);
 });
 
-test("publish-stop defaults to websocket transport and claims by id", async () => {
+test("publish-stop claims websocket replies by id", async () => {
   const mockPath = mockFile({
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
     "POST /threads/codex-thread-1/replies/reply_1/claim": {
@@ -697,7 +686,7 @@ test("publish-stop defaults to websocket transport and claims by id", async () =
   writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({
     apiBaseUrl: "https://example.test",
     token: "dev-token",
-    stopPollSeconds: 0,
+    stopWaitSeconds: 0,
   }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
@@ -754,7 +743,7 @@ test("publish-stop reconnects when websocket closes before a reply", async () =>
   writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({
     apiBaseUrl: "https://example.test",
     token: "dev-token",
-    stopPollSeconds: 5,
+    stopWaitSeconds: 5,
   }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
@@ -793,23 +782,20 @@ test("publish-stop reconnects when websocket closes before a reply", async () =>
 test("publish-stop formats multi-line remote replies including blank lines", async () => {
   const mockPath = mockFile({
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
-    "GET /threads/codex-thread-1/pending": {
-      body: {
-        replies: [
-          { id: "reply_1", body: "First line\n\nThird line", createdAt: "2026-04-25T18:30:00.000Z" },
-        ],
-      },
-    },
     "POST /threads/codex-thread-1/replies/reply_1/claim": {
       body: { ok: true, reply: { id: "reply_1", body: "First line\n\nThird line" } },
     },
   });
+  const mock = JSON.parse(readFileSync(mockPath, "utf8"));
+  mock.websocketEvents = {
+    "/threads/codex-thread-1/events": [{ type: "reply-pending", replyId: "reply_1" }],
+  };
+  writeFileSync(mockPath, JSON.stringify(mock));
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
   writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({
     apiBaseUrl: "https://example.test",
     token: "dev-token",
-    stopPollSeconds: 0,
-    transport: "poll",
+    stopWaitSeconds: 0,
   }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
@@ -839,18 +825,6 @@ test("publish-stop formats multi-line remote replies including blank lines", asy
 test("publish-stop downloads one remote image and includes the local path", async () => {
   const mockPath = mockFile({
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
-    "GET /threads/codex-thread-1/pending": {
-      body: {
-        replies: [
-          {
-            id: "reply_1",
-            body: "What is this?",
-            media: [{ url: "https://cdn.example.test/cow.jpg" }],
-            createdAt: "2026-04-25T18:30:00.000Z",
-          },
-        ],
-      },
-    },
     "POST /threads/codex-thread-1/replies/reply_1/claim": {
       body: {
         ok: true,
@@ -863,6 +837,9 @@ test("publish-stop downloads one remote image and includes the local path", asyn
     },
   });
   const mock = JSON.parse(readFileSync(mockPath, "utf8"));
+  mock.websocketEvents = {
+    "/threads/codex-thread-1/events": [{ type: "reply-pending", replyId: "reply_1" }],
+  };
   mock.mediaResponses = {
     "https://cdn.example.test/cow.jpg": {
       contentType: "image/jpeg",
@@ -874,8 +851,7 @@ test("publish-stop downloads one remote image and includes the local path", asyn
   writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({
     apiBaseUrl: "https://example.test",
     token: "dev-token",
-    stopPollSeconds: 0,
-    transport: "poll",
+    stopWaitSeconds: 0,
   }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
@@ -906,21 +882,6 @@ test("publish-stop downloads one remote image and includes the local path", asyn
 test("publish-stop downloads multiple remote images in order", async () => {
   const mockPath = mockFile({
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
-    "GET /threads/codex-thread-1/pending": {
-      body: {
-        replies: [
-          {
-            id: "reply_group",
-            body: "Compare these",
-            media: [
-              { url: "https://cdn.example.test/one.png" },
-              { url: "https://cdn.example.test/two.webp" },
-            ],
-            createdAt: "2026-04-25T18:30:00.000Z",
-          },
-        ],
-      },
-    },
     "POST /threads/codex-thread-1/replies/reply_group/claim": {
       body: {
         ok: true,
@@ -936,6 +897,9 @@ test("publish-stop downloads multiple remote images in order", async () => {
     },
   });
   const mock = JSON.parse(readFileSync(mockPath, "utf8"));
+  mock.websocketEvents = {
+    "/threads/codex-thread-1/events": [{ type: "reply-pending", replyId: "reply_group" }],
+  };
   mock.mediaResponses = {
     "https://cdn.example.test/one.png": {
       contentType: "image/png",
@@ -951,8 +915,7 @@ test("publish-stop downloads multiple remote images in order", async () => {
   writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({
     apiBaseUrl: "https://example.test",
     token: "dev-token",
-    stopPollSeconds: 0,
-    transport: "poll",
+    stopWaitSeconds: 0,
   }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
@@ -985,18 +948,6 @@ test("publish-stop downloads multiple remote images in order", async () => {
 test("publish-stop reports a clear error when remote image download fails", async () => {
   const mockPath = mockFile({
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
-    "GET /threads/codex-thread-1/pending": {
-      body: {
-        replies: [
-          {
-            id: "reply_1",
-            body: "Inspect this",
-            media: [{ url: "https://cdn.example.test/missing.jpg" }],
-            createdAt: "2026-04-25T18:30:00.000Z",
-          },
-        ],
-      },
-    },
     "POST /threads/codex-thread-1/replies/reply_1/claim": {
       body: {
         ok: true,
@@ -1008,12 +959,16 @@ test("publish-stop reports a clear error when remote image download fails", asyn
       },
     },
   });
+  const mock = JSON.parse(readFileSync(mockPath, "utf8"));
+  mock.websocketEvents = {
+    "/threads/codex-thread-1/events": [{ type: "reply-pending", replyId: "reply_1" }],
+  };
+  writeFileSync(mockPath, JSON.stringify(mock));
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
   writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({
     apiBaseUrl: "https://example.test",
     token: "dev-token",
-    stopPollSeconds: 0,
-    transport: "poll",
+    stopWaitSeconds: 0,
   }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
@@ -1039,7 +994,7 @@ test("publish-stop reports a clear error when remote image download fails", asyn
   assert.match(parsed.reason, /Attached images could not be downloaded: No mock media response/);
 });
 
-test("publish-stop exits without polling when active entry is missing", async () => {
+test("publish-stop exits without waiting when active entry is missing", async () => {
   const mockPath = mockFile({
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
   });
@@ -1047,8 +1002,7 @@ test("publish-stop exits without polling when active entry is missing", async ()
   writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({
     apiBaseUrl: "https://example.test",
     token: "dev-token",
-    stopPollSeconds: 0,
-    transport: "poll",
+    stopWaitSeconds: 0,
   }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({ threads: {} }));
 
@@ -1067,19 +1021,16 @@ test("publish-stop exits without polling when active entry is missing", async ()
   assert.equal(mock.calls?.length ?? 0, 0);
 });
 
-test("publish-stop exits during polling after stop-remote removes the active entry", async () => {
+test("publish-stop exits during websocket wait after stop-remote removes the active entry", async () => {
   const mockPath = mockFile({
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
-    "GET /threads/codex-thread-1/pending": { body: { replies: [] } },
     "POST /threads/codex-thread-1/stop": { body: { ok: true } },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
   writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({
     apiBaseUrl: "https://example.test",
     token: "dev-token",
-    stopPollSeconds: 3,
-    transport: "poll",
-    stopPollIntervalSeconds: 1,
+    stopWaitSeconds: 3,
   }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
@@ -1159,7 +1110,7 @@ test("publish-stop stores empty assistant messages as null", async () => {
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
-  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopPollSeconds: 0 }));
+  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopWaitSeconds: 0 }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
       "codex-thread-1": {
@@ -1189,7 +1140,7 @@ test("publish-stop preserves substantive assistant summaries", async () => {
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
-  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopPollSeconds: 0 }));
+  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopWaitSeconds: 0 }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
       "codex-thread-1": {
@@ -1219,7 +1170,7 @@ test("publish-stop skips the local start-remote activation status once", async (
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
-  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopPollSeconds: 0 }));
+  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopWaitSeconds: 0 }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
       "codex-thread-1": {
@@ -1252,7 +1203,7 @@ test("publish-stop strips local-only remote message blocks before publishing sta
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
-  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopPollSeconds: 0 }));
+  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopWaitSeconds: 0 }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
       "codex-thread-1": {
@@ -1287,7 +1238,7 @@ test("publish-stop strips local-only remote message blocks when the header is qu
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
-  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopPollSeconds: 0 }));
+  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopWaitSeconds: 0 }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
       "codex-thread-1": {
@@ -1322,7 +1273,7 @@ test("publish-stop strips multi-line local display blocks before publishing stat
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
-  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopPollSeconds: 0 }));
+  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopWaitSeconds: 0 }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
       "codex-thread-1": {
@@ -1371,7 +1322,7 @@ test("publish-stop includes new generated images from the session log", async ()
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
-  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopPollSeconds: 0 }));
+  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopWaitSeconds: 0 }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
       "codex-thread-1": {
@@ -1420,7 +1371,7 @@ test("publish-stop skips generated images that were already sent", async () => {
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
-  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopPollSeconds: 0 }));
+  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopWaitSeconds: 0 }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
       "codex-thread-1": {
@@ -1466,7 +1417,7 @@ test("publish-stop keeps generated images retryable when notification fails", as
     },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
-  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopPollSeconds: 0 }));
+  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopWaitSeconds: 0 }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
       "codex-thread-1": {
@@ -1512,7 +1463,7 @@ test("publish-stop preserves multiple generated images in order", async () => {
     "POST /threads/codex-thread-1/status": { body: { ok: true } },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
-  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopPollSeconds: 0 }));
+  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token", stopWaitSeconds: 0 }));
   writeFileSync(path.join(stateDir, "active-threads.json"), JSON.stringify({
     threads: {
       "codex-thread-1": {

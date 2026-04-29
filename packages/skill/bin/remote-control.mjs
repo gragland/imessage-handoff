@@ -51,17 +51,6 @@ function normalizeRelayUrl(value) {
   return String(value || "").replace(/\/+$/, "");
 }
 
-function normalizeTransport(value) {
-  const raw = String(value || "websocket").trim().toLowerCase();
-  if (raw === "websocket" || raw === "ws") {
-    return "websocket";
-  }
-  if (raw === "poll" || raw === "polling") {
-    return "poll";
-  }
-  throw new Error("--transport must be poll or websocket.");
-}
-
 async function createInstallToken(apiBaseUrl) {
   // The relay gives each install a bearer token. That token becomes the local
   // identity later linked to the user's phone during pairing.
@@ -92,7 +81,7 @@ function ensureCodexHooksEnabled(configPath) {
 
 function installSkill(skillTargetDir, codexHome) {
   // Reinstall the packaged skill files, but keep .state so upgrades do not
-  // accidentally lose the user's token, active thread list, or transport choice.
+  // accidentally lose the user's token or active thread list.
   mkdirSync(path.dirname(skillTargetDir), { recursive: true });
   const statePath = path.join(skillTargetDir, ".state");
   const preservedStatePath = path.join(codexHome, `.remote-control-state-${process.pid}`);
@@ -213,7 +202,6 @@ async function install() {
   const hooksPath = path.join(codexHome, "hooks.json");
   const codexConfigPath = path.join(codexHome, "config.toml");
   const existingConfig = readJson(configPath, null);
-  const transport = normalizeTransport(readArg("transport") || process.env.REMOTE_CONTROL_TRANSPORT || existingConfig?.transport);
   const canReuseToken = existingConfig
     && existingConfig.apiBaseUrl === apiBaseUrl
     && typeof existingConfig.token === "string"
@@ -225,16 +213,13 @@ async function install() {
   writeJson(configPath, {
     apiBaseUrl,
     token,
-    stopPollSeconds: Number(existingConfig?.stopPollSeconds) || 86400,
-    stopPollIntervalSeconds: Number(existingConfig?.stopPollIntervalSeconds) || 5,
-    transport,
+    stopWaitSeconds: Number(existingConfig?.stopWaitSeconds) || 86400,
   });
   installStopHook(hooksPath, skillTargetDir);
 
   console.log(JSON.stringify({
     ok: true,
     apiBaseUrl,
-    transport,
     tokenCreated: !canReuseToken,
     skillPath: skillTargetDir,
     hooksPath,
@@ -255,7 +240,7 @@ function uninstall() {
 
 const command = process.argv[2] && !process.argv[2].startsWith("--") ? process.argv[2] : "install";
 if (command !== "install" && command !== "uninstall") {
-  console.error("Usage: remote-control install [--relay-url=https://...] [--codex-home=/path] [--transport=poll|websocket] [--reset-token]\n       remote-control uninstall [--codex-home=/path]");
+  console.error("Usage: remote-control install [--relay-url=https://...] [--codex-home=/path] [--reset-token]\n       remote-control uninstall [--codex-home=/path]");
   process.exit(2);
 }
 

@@ -404,17 +404,6 @@ async function claimReplyById(config, codexThreadId, replyId) {
   return claimed.ok && claimed.reply ? claimed.reply : null;
 }
 
-async function claimNextReply(config, codexThreadId) {
-  const encodedThreadId = encodeURIComponent(codexThreadId);
-  const pending = await apiFetch(config, `/threads/${encodedThreadId}/pending`);
-  const reply = Array.isArray(pending.replies) ? pending.replies[0] : null;
-  if (!reply) {
-    return null;
-  }
-
-  return claimReplyById(config, codexThreadId, reply.id);
-}
-
 async function stopRemoteThread(config, codexThreadId) {
   try {
     await apiFetch(config, `/threads/${encodeURIComponent(codexThreadId)}/stop`, { method: "POST" });
@@ -435,54 +424,14 @@ async function disableRemoteForLocalTakeover(config, codexThreadId, active) {
 }
 
 async function waitForReplyWhileActive(config, codexThreadId) {
-  // The transport switch is local-only. Both modes still claim from the same
-  // relay Durable Object buffer.
-  return config.transport === "websocket"
-    ? waitForReplyByWebSocket(config, codexThreadId)
-    : waitForReplyByPolling(config, codexThreadId);
-}
-
-async function waitForReplyByPolling(config, codexThreadId, deadline = Date.now() + Math.max(0, config.stopPollSeconds) * 1000) {
-  // Polling fallback: ask the relay repeatedly for a claimable reply while also
-  // checking local state so stop-remote/local input can interrupt quickly.
-  const intervalMs = Math.max(1, config.stopPollIntervalSeconds) * 1000;
-  const localFollowUpCheckMs = 250;
-
-  while (true) {
-    const active = readActiveThreads();
-    if (!active.threads[codexThreadId]) {
-      return null;
-    }
-    if (hasQueuedLocalFollowUp(codexThreadId)) {
-      return disableRemoteForLocalTakeover(config, codexThreadId, active);
-    }
-
-    const reply = await claimNextReply(config, codexThreadId);
-    if (reply) {
-      return reply;
-    }
-    if (Date.now() >= deadline) {
-      return null;
-    }
-    const sleepUntil = Date.now() + Math.min(intervalMs, Math.max(0, deadline - Date.now()));
-    while (Date.now() < sleepUntil) {
-      await sleep(Math.min(localFollowUpCheckMs, Math.max(0, sleepUntil - Date.now())));
-      const latestActive = readActiveThreads();
-      if (!latestActive.threads[codexThreadId]) {
-        return null;
-      }
-      if (hasQueuedLocalFollowUp(codexThreadId)) {
-        return disableRemoteForLocalTakeover(config, codexThreadId, latestActive);
-      }
-    }
-  }
+  return waitForReplyByWebSocket(config, codexThreadId);
 }
 
 async function waitForReplyByWebSocket(config, codexThreadId) {
-  // Default transport: keep a socket open during the Stop hook wait. A
-  // reply-pending event wakes the hook without repeated HTTP polling. If the
+  // Keep a socket open during the Stop hook wait. A
+  // reply-pending event wakes the hook without repeated HTTP requests. If the
   // connection drops before a reply arrives, retry with bounded backoff.
-  const deadline = Date.now() + Math.max(0, config.stopPollSeconds) * 1000;
+  const deadline = Date.now() + Math.max(0, config.stopWaitSeconds) * 1000;
   const localFollowUpCheckMs = 250;
 
   for (let attempt = 0; attempt === 0 || Date.now() < deadline; attempt += 1) {
@@ -496,7 +445,7 @@ async function waitForReplyByWebSocket(config, codexThreadId) {
 
     const socketWait = startWebSocketWait(config, codexThreadId);
     if (!socketWait) {
-      return waitForReplyByPolling(config, codexThreadId, deadline);
+      return null;
     }
 
     let replyId = null;
@@ -598,7 +547,7 @@ function continuationForReply(reply) {
 
   return [
     "Treat the following remote message exactly as if the user typed it directly in this chat.",
-    "Do not mention remote control, queued replies, claimed replies, Stop hooks, polling, WebSockets, or message receipt.",
+    "Do not mention remote control, queued replies, claimed replies, Stop hooks, WebSockets, or message receipt.",
     "Start your assistant response with the local display block below exactly as shown, then a blank line, then the substantive answer, code changes, or work summary you would normally give the user.",
     "The blockquote is visible in the local Codex thread; the Stop hook removes this leading display block before sending the answer back over iMessage.",
     "Do not otherwise repeat or paraphrase the remote message.",
@@ -617,7 +566,7 @@ function continuationForLocalTakeover() {
     "Remote Control was active, but the user has sent a message locally in Codex.",
     "Start your assistant response with this friendly note, then a blank line, then continue normally with the user's local message:",
     "\"Got it - I'll turn off Remote Control since you're back here in Codex.\"",
-    "Do not mention Stop hooks, queued follow-ups, polling, WebSockets, message receipt, or implementation details.",
+    "Do not mention Stop hooks, queued follow-ups, WebSockets, message receipt, or implementation details.",
   ].join("\n");
 }
 

@@ -38,8 +38,6 @@ npx @gaberagland/remote-control install
 Installer options:
 
 ```bash
-npx github:gragland/remote-control install --transport=websocket
-npx github:gragland/remote-control install --transport=poll
 npx github:gragland/remote-control install --relay-url=https://<your-worker-url>
 npx github:gragland/remote-control install --reset-token
 ```
@@ -73,11 +71,11 @@ This removes the global Stop hook used for communication with the relay.
 1. The installer asks the relay for a token and stores it locally in the installed skill directory.
 2. `start remote` registers the current `CODEX_THREAD_ID` with the relay.
 3. When you text the pairing code, the relay links that local token to your phone number.
-4. iMessages from your paired phone become pending replies for the active Codex thread.
-5. The local Stop hook waits via the configured transport, either polling or WebSocket, claims a reply from the relay, and continues the original Codex thread.
+4. The local Stop hook waits on a WebSocket connection to the relay.
+5. When an iMessage arrives from your paired phone, the relay wakes the waiting hook, the hook claims the message, and Codex continues the original thread.
 6. Codex results are forwarded to iMessage through Sendblue.
 
-By default, the local Stop hook maintains a WebSocket connection with the relay while it waits for remote input. When a new iMessage arrives, the relay wakes the waiting hook, the hook claims the message, and Codex continues the original thread. Polling mode is still available as a fallback and checks the same relay over HTTP.
+The local Stop hook maintains a WebSocket connection with the relay while it waits for remote input.
 
 ## Commands
 
@@ -87,8 +85,6 @@ Local Codex:
 start remote
 stop remote
 ```
-
-The local transport defaults to WebSocket delivery. To use polling instead, run the installer with `--transport=poll` or set `REMOTE_CONTROL_TRANSPORT=poll`; use `websocket` to switch back.
 
 iMessage:
 

@@ -52,9 +52,7 @@ function readConfig() {
     return {
       apiBaseUrl: String(config.apiBaseUrl).replace(/\/+$/, ""),
       token: String(config.token),
-      stopPollSeconds: readNumber(config.stopPollSeconds, process.env.REMOTE_CONTROL_STOP_POLL_SECONDS, 86400),
-      stopPollIntervalSeconds: readNumber(config.stopPollIntervalSeconds, process.env.REMOTE_CONTROL_STOP_POLL_INTERVAL_SECONDS, 5),
-      transport: readTransport(config.transport, process.env.REMOTE_CONTROL_TRANSPORT),
+      stopWaitSeconds: readNumber(config.stopWaitSeconds, process.env.REMOTE_CONTROL_STOP_WAIT_SECONDS, 86400),
     };
   }
 
@@ -68,9 +66,7 @@ function readConfig() {
     return {
       apiBaseUrl: config.apiBaseUrl,
       token: config.token,
-      stopPollSeconds: readNumber(undefined, process.env.REMOTE_CONTROL_STOP_POLL_SECONDS, 86400),
-      stopPollIntervalSeconds: readNumber(undefined, process.env.REMOTE_CONTROL_STOP_POLL_INTERVAL_SECONDS, 5),
-      transport: readTransport(undefined, process.env.REMOTE_CONTROL_TRANSPORT),
+      stopWaitSeconds: readNumber(undefined, process.env.REMOTE_CONTROL_STOP_WAIT_SECONDS, 86400),
     };
   }
 
@@ -88,7 +84,6 @@ async function ensureLocalInstall() {
     || existingConfig?.apiBaseUrl
     || defaultRelayUrl
   ).replace(/\/+$/, "");
-  const transport = readTransport(existingConfig?.transport, process.env.REMOTE_CONTROL_TRANSPORT);
   const token = existingConfig && typeof existingConfig.token === "string" && existingConfig.token.trim()
     ? existingConfig.token.trim()
     : process.env.REMOTE_CONTROL_TOKEN
@@ -98,9 +93,7 @@ async function ensureLocalInstall() {
   writeJson(configPath, {
     apiBaseUrl,
     token,
-    stopPollSeconds: readNumber(existingConfig?.stopPollSeconds, process.env.REMOTE_CONTROL_STOP_POLL_SECONDS, 86400),
-    stopPollIntervalSeconds: readNumber(existingConfig?.stopPollIntervalSeconds, process.env.REMOTE_CONTROL_STOP_POLL_INTERVAL_SECONDS, 5),
-    transport,
+    stopWaitSeconds: readNumber(existingConfig?.stopWaitSeconds, process.env.REMOTE_CONTROL_STOP_WAIT_SECONDS, 86400),
   });
   ensureCodexHooksEnabled(path.join(codexHome(), "config.toml"));
   installStopHook(path.join(codexHome(), "hooks.json"), skillDir);
@@ -178,18 +171,6 @@ function installStopHook(hooksPath, targetSkillDir) {
   hooks.Stop = groups;
   root.hooks = hooks;
   writeJson(hooksPath, root);
-}
-
-function readTransport(configValue, envValue) {
-  // WebSocket is the normal path. Polling remains available as a simple fallback
-  // if a network or runtime environment cannot keep a socket open.
-  const raw = String(envValue !== undefined && envValue !== null && envValue !== "" ? envValue : configValue || "websocket")
-    .trim()
-    .toLowerCase();
-  if (raw === "poll" || raw === "polling") {
-    return "poll";
-  }
-  return "websocket";
 }
 
 function readNumber(configValue, envValue, fallback) {

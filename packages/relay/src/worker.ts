@@ -1,7 +1,7 @@
 import type { Env, PhoneBindingRow, RemoteReplyRow, RemoteThreadRow } from "./types.ts";
 
 // The relay is intentionally small: one Worker file handles registration,
-// Sendblue webhooks, local Codex polling/WebSockets, and outbound Sendblue sends.
+// Sendblue webhooks, local Codex WebSockets, and outbound Sendblue sends.
 // Durable storage is only for routing metadata; message content is kept in the
 // Durable Object buffer and scrubbed when local Codex claims it.
 
@@ -69,12 +69,9 @@ export class RemoteThreadSocket {
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter(Boolean);
 
-    // Internal HTTP routes are used by the Worker to insert, list, and claim
-    // messages from the same buffer that WebSocket clients listen to.
+    // Internal HTTP routes are used by the Worker to insert and claim messages
+    // from the same buffer that WebSocket clients listen to.
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-      if (request.method === "GET" && parts[0] === "threads" && parts[1] && parts[2] === "pending" && parts.length === 3) {
-        return json({ replies: eligiblePendingReplies(this.pendingRows(parts[1])).slice(0, 10) });
-      }
       if (request.method === "POST" && parts[0] === "threads" && parts[1] && parts[2] === "replies" && parts.length === 3) {
         return await this.handleInsertReply(request, parts[1]);
       }
@@ -390,7 +387,7 @@ function assertAuthorized(thread: RemoteThreadRow | null, ownerId: string) {
   return thread;
 }
 
-function publicThread(thread: RemoteThreadRow, pendingReplies: Array<Pick<RemoteReplyRow, "id" | "body" | "media" | "created_at">> = []) {
+function publicThread(thread: RemoteThreadRow) {
   return {
     id: thread.id,
     cwd: thread.cwd,
@@ -402,12 +399,6 @@ function publicThread(thread: RemoteThreadRow, pendingReplies: Array<Pick<Remote
     lastStopAt: thread.last_stop_at,
     createdAt: thread.created_at,
     updatedAt: thread.updated_at,
-    pendingReplies: pendingReplies.map((reply) => ({
-      id: reply.id,
-      body: reply.body,
-      media: parseReplyMedia(reply.media),
-      createdAt: reply.created_at,
-    })),
   };
 }
 
@@ -491,18 +482,12 @@ async function findPairingThread(env: Env, pairingCode: string) {
 }
 
 async function findExternalReply(env: Env, externalId: string) {
-  // Sendblue may retry webhooks. Store/check only external ids for dedupe; the
-  // actual message content can still be kept out of D1 when the DO is enabled.
-  if (env.REMOTE_THREAD_SOCKET) {
-    const response = await env.REMOTE_THREAD_SOCKET
-      .get(env.REMOTE_THREAD_SOCKET.idFromName("global"))
-      .fetch(new Request(`https://remote-control.internal/external-replies/${encodeURIComponent(externalId)}`));
-    const body = await response.json() as { exists?: boolean };
-    return body.exists ? { id: externalId } : null;
-  }
-  return env.DB.prepare("SELECT id FROM remote_replies WHERE external_id = ?")
-    .bind(externalId)
-    .first<Pick<RemoteReplyRow, "id">>();
+  // Sendblue may retry webhooks. The DO stores external ids in memory so we can
+  // dedupe retries without writing message content to D1.
+  const response = await relaySocket(env)
+    .fetch(new Request(`https://remote-control.internal/external-replies/${encodeURIComponent(externalId)}`));
+  const body = await response.json() as { exists?: boolean };
+  return body.exists ? { id: externalId } : null;
 }
 
 async function findPhoneForThread(env: Env, threadId: string) {
@@ -1001,107 +986,19 @@ async function handleStatus(request: Request, env: Env, threadId: string) {
   return json({ ok: true, notification });
 }
 
-async function handlePending(request: Request, env: Env, threadId: string) {
-  // Polling transport: local Codex asks whether the DO buffer has a claimable
-  // reply. The D1 path remains only as a fallback for older/self-hosted configs.
-  const ownerId = await requireOwnerId(request);
-  assertAuthorized(await findThread(env, threadId), ownerId);
-  if (env.REMOTE_THREAD_SOCKET) {
-    return env.REMOTE_THREAD_SOCKET
-      .get(env.REMOTE_THREAD_SOCKET.idFromName("global"))
-      .fetch(new Request(`https://remote-control.internal/threads/${encodeURIComponent(threadId)}/pending`));
-  }
-  const { results } = await env.DB.prepare(
-    `SELECT *
-      FROM remote_replies
-      WHERE thread_id = ? AND status = 'pending'
-      ORDER BY created_at ASC
-      LIMIT 50`,
-  ).bind(threadId).all<RemoteReplyRow>();
-
-  return json({
-    replies: eligiblePendingReplies(results).slice(0, 10),
-  });
-}
-
 async function handleClaim(request: Request, env: Env, threadId: string, replyId: string) {
   // Claim returns exactly one remote prompt to local Codex and marks it applied.
   // The typing indicator is sent after claim to make the iMessage side feel live.
   const ownerId = await requireOwnerId(request);
   assertAuthorized(await findThread(env, threadId), ownerId);
-  if (env.REMOTE_THREAD_SOCKET) {
-    const claim = await env.REMOTE_THREAD_SOCKET
-      .get(env.REMOTE_THREAD_SOCKET.idFromName("global"))
-      .fetch(new Request(`https://remote-control.internal/threads/${encodeURIComponent(threadId)}/replies/${encodeURIComponent(replyId)}/claim`, {
-        method: "POST",
-      }));
-    if (!claim.ok) {
-      return claim;
-    }
-    const body = await claim.json() as { ok?: boolean; reply?: unknown };
-    const binding = await findPhoneForThread(env, threadId);
-    if (binding) {
-      try {
-        const delayMs = sendblueTypingDelayMs(env);
-        if (delayMs > 0) {
-          await sleep(delayMs);
-        }
-        await sendSendblueTypingIndicator(env, binding.phone_number);
-      } catch {
-        console.warn("Sendblue typing indicator failed.");
-      }
-    }
-    return json(body);
+  const claim = await relaySocket(env)
+    .fetch(new Request(`https://remote-control.internal/threads/${encodeURIComponent(threadId)}/replies/${encodeURIComponent(replyId)}/claim`, {
+      method: "POST",
+    }));
+  if (!claim.ok) {
+    return claim;
   }
-  const appliedAt = nowIso();
-  const selectedReply = await env.DB.prepare(
-    "SELECT * FROM remote_replies WHERE id = ? AND thread_id = ? AND status = 'pending'",
-  ).bind(replyId, threadId).first<RemoteReplyRow>();
-
-  if (!selectedReply) {
-    return json({ ok: false, error: "Reply is not pending." }, { status: 409 });
-  }
-
-  let replyRows = [selectedReply];
-  let reply = combineReplyRows(replyRows);
-  let result: D1Result;
-
-  if (selectedReply.media_group_id) {
-    const { results } = await env.DB.prepare(
-      `SELECT *
-        FROM remote_replies
-        WHERE thread_id = ? AND media_group_id = ? AND status = 'pending'
-        ORDER BY media_index ASC, created_at ASC`,
-    ).bind(threadId, selectedReply.media_group_id).all<RemoteReplyRow>();
-    replyRows = results;
-    reply = combineReplyRows(replyRows);
-    // Preserve the external Sendblue ids for retry dedupe, but scrub message
-    // contents as soon as local Codex has fetched them.
-    result = await env.DB.prepare(
-      `UPDATE remote_replies
-        SET status = 'applied',
-            body = '',
-            media = NULL,
-            applied_at = ?
-        WHERE thread_id = ? AND media_group_id = ? AND status = 'pending'`,
-    ).bind(appliedAt, threadId, selectedReply.media_group_id).run();
-  } else {
-    // Preserve the external Sendblue id for retry dedupe, but scrub message
-    // contents as soon as local Codex has fetched it.
-    result = await env.DB.prepare(
-      `UPDATE remote_replies
-        SET status = 'applied',
-            body = '',
-            media = NULL,
-            applied_at = ?
-        WHERE id = ? AND thread_id = ? AND status = 'pending'`,
-    ).bind(appliedAt, replyId, threadId).run();
-  }
-
-  if (!result.meta || result.meta.changes < 1) {
-    return json({ ok: false, error: "Reply is not pending." }, { status: 409 });
-  }
-
+  const body = await claim.json() as { ok?: boolean; reply?: unknown };
   const binding = await findPhoneForThread(env, threadId);
   if (binding) {
     try {
@@ -1114,11 +1011,7 @@ async function handleClaim(request: Request, env: Env, threadId: string, replyId
       console.warn("Sendblue typing indicator failed.");
     }
   }
-
-  return json({
-    ok: true,
-    reply,
-  });
+  return json(body);
 }
 
 async function insertRemoteReply(
@@ -1129,37 +1022,25 @@ async function insertRemoteReply(
   status: "pending" | "applied" = "pending",
   mediaUrl: string | null = null,
 ) {
-  // The normal path writes inbound content to the global DO. The D1 insert path
-  // is retained as a fallback, but launch config should use the DO binding.
-  if (env.REMOTE_THREAD_SOCKET) {
-    const response = await env.REMOTE_THREAD_SOCKET
-      .get(env.REMOTE_THREAD_SOCKET.idFromName("global"))
-      .fetch(new Request(`https://remote-control.internal/threads/${encodeURIComponent(threadId)}/replies`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ body, externalId, status, mediaUrl }),
-      }));
-    const responseBody = await response.json() as { id?: string };
-    if (!response.ok || !responseBody.id) {
-      throw new Error("Remote relay buffer did not accept reply.");
-    }
-    return responseBody.id;
+  // Inbound content always goes through the global DO so it stays out of D1.
+  const response = await relaySocket(env)
+    .fetch(new Request(`https://remote-control.internal/threads/${encodeURIComponent(threadId)}/replies`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body, externalId, status, mediaUrl }),
+    }));
+  const responseBody = await response.json() as { id?: string };
+  if (!response.ok || !responseBody.id) {
+    throw new Error("Remote relay buffer did not accept reply.");
   }
+  return responseBody.id;
+}
 
-  const id = makeId("reply");
-  const createdAt = nowIso();
-  const isTombstone = status === "applied";
-  // Control messages such as pairing and thread switching only need an external-id
-  // tombstone for dedupe; their content is not retained.
-  const storedBody = isTombstone ? "" : body;
-  const media = isTombstone ? null : replyMediaJson(mediaUrl);
-  const { mediaGroupId, mediaIndex } = sendblueMediaGroup(externalId, mediaUrl);
-  await env.DB.prepare(
-    `INSERT INTO remote_replies (
-      id, thread_id, external_id, body, media, media_group_id, media_index, status, created_at, applied_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).bind(id, threadId, externalId, storedBody, media, mediaGroupId, mediaIndex, status, createdAt, isTombstone ? createdAt : null).run();
-  return id;
+function relaySocket(env: Env) {
+  if (!env.REMOTE_THREAD_SOCKET) {
+    throw Object.assign(new Error("Remote thread socket Durable Object is not configured."), { status: 500 });
+  }
+  return env.REMOTE_THREAD_SOCKET.get(env.REMOTE_THREAD_SOCKET.idFromName("global"));
 }
 
 async function handleSendblueWebhook(request: Request, env: Env) {
@@ -1283,13 +1164,7 @@ async function handleGetThread(request: Request, env: Env, threadId: string) {
   // Debug/read endpoint for local development and smoke tests.
   const ownerId = await requireOwnerId(request);
   const thread = assertAuthorized(await findThread(env, threadId), ownerId);
-  const { results } = await env.DB.prepare(
-    `SELECT id, body, media, created_at
-      FROM remote_replies
-      WHERE thread_id = ? AND status = 'pending'
-      ORDER BY created_at ASC`,
-  ).bind(threadId).all<Pick<RemoteReplyRow, "id" | "body" | "media" | "created_at">>();
-  return json(publicThread(thread, results));
+  return json(publicThread(thread));
 }
 
 async function handleStopThread(request: Request, env: Env, threadId: string) {
@@ -1322,7 +1197,7 @@ async function handleStopThread(request: Request, env: Env, threadId: string) {
 }
 
 async function handleThreadEvents(request: Request, env: Env, threadId: string) {
-  // WebSocket transport: authenticate in the Worker, then hand the upgraded
+  // WebSocket delivery: authenticate in the Worker, then hand the upgraded
   // connection to the single global DO that owns the in-memory buffer.
   if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
     return error(426, "WebSocket upgrade required.");
@@ -1376,9 +1251,6 @@ export async function handleRequest(request: Request, env: Env) {
       }
       if (request.method === "POST" && parts[2] === "stop" && parts.length === 3) {
         return await handleStopThread(request, env, threadId);
-      }
-      if (request.method === "GET" && parts[2] === "pending" && parts.length === 3) {
-        return await handlePending(request, env, threadId);
       }
       if (
         request.method === "POST" &&

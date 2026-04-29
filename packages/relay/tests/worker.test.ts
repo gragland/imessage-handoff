@@ -11,6 +11,7 @@ async function ownerIdForToken(token: string) {
 }
 
 const DEV_OWNER_ID = await ownerIdForToken("dev-token");
+const relayBuffers = new WeakMap<Env, RemoteThreadSocket>();
 
 class FakeStatement {
   #db: FakeD1Database;
@@ -45,7 +46,6 @@ class FakeD1Database {
   // issues. When a production query changes, this fake usually needs the same
   // behavior added so tests continue to mirror the deployed relay.
   threads = new Map<string, RemoteThreadRow>();
-  replies = new Map<string, RemoteReplyRow>();
   phoneBindings = new Map<string, PhoneBindingRow>();
 
   prepare(sql: string) {
@@ -140,23 +140,6 @@ class FakeD1Database {
       return { meta: { changes: 1 } };
     }
 
-    if (sql.includes("INSERT INTO remote_replies")) {
-      const [id, threadId, externalId, body, media, mediaGroupId, mediaIndex, status, createdAt, appliedAt] = values as Array<string | number | null>;
-      this.replies.set(String(id), {
-        id: String(id),
-        thread_id: String(threadId),
-        external_id: externalId === null ? null : String(externalId),
-        body: String(body),
-        media: media === null ? null : String(media),
-        media_group_id: mediaGroupId === null ? null : String(mediaGroupId),
-        media_index: mediaIndex === null ? null : Number(mediaIndex),
-        status: status as RemoteReplyRow["status"],
-        created_at: String(createdAt),
-        applied_at: appliedAt === null ? null : String(appliedAt),
-      });
-      return { meta: { changes: 1 } };
-    }
-
     if (sql.includes("DELETE FROM phone_bindings")) {
       const [ownerId, phoneNumber] = values as string[];
       for (const [key, binding] of this.phoneBindings.entries()) {
@@ -185,34 +168,6 @@ class FakeD1Database {
       return { meta: { changes: 1 } };
     }
 
-    if (sql.includes("UPDATE remote_replies") && sql.includes("media_group_id = ?")) {
-      const [appliedAt, threadId, mediaGroupId] = values as string[];
-      let changes = 0;
-      for (const reply of this.replies.values()) {
-        if (reply.thread_id === threadId && reply.media_group_id === mediaGroupId && reply.status === "pending") {
-          reply.status = "applied";
-          reply.body = "";
-          reply.media = null;
-          reply.applied_at = appliedAt;
-          changes += 1;
-        }
-      }
-      return { meta: { changes } };
-    }
-
-    if (sql.includes("UPDATE remote_replies")) {
-      const [appliedAt, id, threadId] = values as string[];
-      const reply = this.replies.get(id);
-      if (!reply || reply.thread_id !== threadId || reply.status !== "pending") {
-        return { meta: { changes: 0 } };
-      }
-      reply.status = "applied";
-      reply.body = "";
-      reply.media = null;
-      reply.applied_at = appliedAt;
-      return { meta: { changes: 1 } };
-    }
-
     throw new Error(`Unexpected run SQL: ${sql}`);
   }
 
@@ -235,31 +190,9 @@ class FakeD1Database {
       return (this.threads.get(String(values[0])) ?? null) as T | null;
     }
 
-    if (sql.includes("SELECT id FROM remote_replies WHERE external_id = ?")) {
-      const externalId = String(values[0]);
-      const reply = [...this.replies.values()].find((candidate) => candidate.external_id === externalId);
-      return (reply ? { id: reply.id } : null) as T | null;
-    }
-
     if (sql.includes("FROM phone_bindings WHERE active_thread_id = ?")) {
       const threadId = String(values[0]);
       return ([...this.phoneBindings.values()].find((binding) => binding.active_thread_id === threadId) ?? null) as T | null;
-    }
-
-    if (sql.includes("SELECT * FROM remote_replies WHERE id = ?")) {
-      const reply = this.replies.get(String(values[0]));
-      if (!reply || reply.thread_id !== values[1] || reply.status !== "pending") {
-        return null;
-      }
-      return reply as T;
-    }
-
-    if (sql.includes("SELECT id, body, created_at FROM remote_replies WHERE id = ?")) {
-      const reply = this.replies.get(String(values[0]));
-      if (!reply || reply.thread_id !== values[1]) {
-        return null;
-      }
-      return reply as T;
     }
 
     throw new Error(`Unexpected first SQL: ${sql}`);
@@ -278,27 +211,12 @@ class FakeD1Database {
       return { results };
     }
 
-    if (sql.includes("FROM remote_replies") && sql.includes("status = 'pending'")) {
-      const threadId = String(values[0]);
-      let results = [...this.replies.values()]
-        .filter((reply) => reply.thread_id === threadId && reply.status === "pending")
-        .sort((a, b) => (
-          (a.media_index ?? 0) - (b.media_index ?? 0)
-          || a.created_at.localeCompare(b.created_at)
-        ));
-      if (sql.includes("media_group_id = ?")) {
-        const mediaGroupId = String(values[1]);
-        results = results.filter((reply) => reply.media_group_id === mediaGroupId);
-      }
-      return { results };
-    }
-
     throw new Error(`Unexpected all SQL: ${sql}`);
   }
 }
 
 function env() {
-  return {
+  const testEnv = {
     DB: new FakeD1Database() as unknown as D1Database,
     SENDBLUE_API_KEY: "sendblue-key",
     SENDBLUE_SECRET_KEY: "sendblue-secret",
@@ -307,6 +225,8 @@ function env() {
     SENDBLUE_API_BASE_URL: "https://api.sendblue.test/api",
     SENDBLUE_TYPING_DELAY_MS: "0",
   } satisfies Env;
+  attachRelayBuffer(testEnv);
+  return testEnv;
 }
 
 function attachRelayBuffer(testEnv: Env) {
@@ -327,6 +247,8 @@ function attachRelayBuffer(testEnv: Env) {
       } as unknown as DurableObjectStub;
     },
   } as unknown as DurableObjectNamespace;
+  relayBuffers.set(testEnv, relay);
+  return relay;
 }
 
 function req(path: string, init: RequestInit = {}) {
@@ -341,6 +263,16 @@ function req(path: string, init: RequestInit = {}) {
 
 async function json(response: Response) {
   return response.json() as Promise<Record<string, unknown>>;
+}
+
+function relayReplies(testEnv: Env) {
+  const relay = relayBuffers.get(testEnv);
+  assert.ok(relay, "test env has a relay buffer");
+  return [...(relay as unknown as { replies: Map<string, RemoteReplyRow> }).replies.values()];
+}
+
+function pendingReplies(testEnv: Env, threadId?: string) {
+  return relayReplies(testEnv).filter((reply) => reply.status === "pending" && (!threadId || reply.thread_id === threadId));
 }
 
 async function notification(response: Response) {
@@ -621,10 +553,7 @@ test("pairs a phone by code without enqueueing a pending reply", async () => {
       content: 'You’re connected to "Remote test" on Codex.\n\nYou were deciding what the first playable prototype should include.\n\nWhat do you want to do next?',
     }]);
 
-    const pending = await handleRequest(req(`/threads/${threadId}/pending`, {
-      headers: { authorization: "Bearer dev-token" },
-    }), testEnv);
-    assert.deepEqual((await json(pending)).replies, []);
+    assert.deepEqual(pendingReplies(testEnv, threadId), []);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -720,10 +649,7 @@ test("pairing rejects phone numbers that do not support iMessage", async () => {
       from_number: "+16452468235",
       content: "Remote Control only supports phone numbers that use iMessage for now.",
     }]);
-    const pending = await handleRequest(req(`/threads/${threadId}/pending`, {
-      headers: { authorization: "Bearer dev-token" },
-    }), testEnv);
-    assert.deepEqual((await json(pending)).replies, []);
+    assert.deepEqual(pendingReplies(testEnv, threadId), []);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -737,12 +663,9 @@ test("subsequent inbound texts from a paired phone enqueue for the active thread
 
   const response = await handleRequest(sendblueWebhook(inboundMessage("What is 2 + 2?", "msg_2")), testEnv);
   assert.equal(response.status, 200);
-  const pending = await handleRequest(req(`/threads/${threadId}/pending`, {
-    headers: { authorization: "Bearer dev-token" },
-  }), testEnv);
-  const body = await json(pending) as { replies: Array<{ body: string }> };
-  assert.equal(body.replies.length, 1);
-  assert.equal(body.replies[0]?.body, "What is 2 + 2?");
+  const replies = pendingReplies(testEnv, threadId);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0]?.body, "What is 2 + 2?");
 });
 
 test("relay buffer keeps inbound message content out of D1", async () => {
@@ -754,16 +677,12 @@ test("relay buffer keeps inbound message content out of D1", async () => {
 
   const response = await handleRequest(sendblueWebhook(inboundMessage("What is buffered?", "msg_buffered")), testEnv);
   assert.equal(response.status, 200);
-  assert.equal([...db.replies.values()].some((reply) => reply.body === "What is buffered?"), false);
+  // The fake D1 no longer implements message-content tables, so this request
+  // would throw if the Worker tried to persist the inbound body there.
 
-  const pending = await handleRequest(req(`/threads/${threadId}/pending`, {
-    headers: { authorization: "Bearer dev-token" },
-  }), testEnv);
-  const body = await json(pending) as { replies: Array<{ id: string; body: string }> };
-  assert.equal(body.replies.length, 1);
-  assert.equal(body.replies[0]?.body, "What is buffered?");
-
-  const replyId = body.replies[0]?.id;
+  const body = await json(response) as { replyId?: string };
+  const replyId = body.replyId;
+  assert.equal(typeof replyId, "string");
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({ status: "SENT", message_handle: "typing-1" }), { status: 200 });
   try {
@@ -778,10 +697,11 @@ test("relay buffer keeps inbound message content out of D1", async () => {
     globalThis.fetch = originalFetch;
   }
 
-  const emptyPending = await handleRequest(req(`/threads/${threadId}/pending`, {
+  const duplicate = await handleRequest(req(`/threads/${threadId}/replies/${replyId}/claim`, {
+    method: "POST",
     headers: { authorization: "Bearer dev-token" },
   }), testEnv);
-  assert.deepEqual((await json(emptyPending)).replies, []);
+  assert.equal(duplicate.status, 409);
 });
 
 test("image-only sendblue webhook creates a pending media reply after quiet window", async () => {
@@ -792,7 +712,7 @@ test("image-only sendblue webhook creates a pending media reply after quiet wind
 
   const response = await handleRequest(sendblueWebhook(inboundImage("", "https://cdn.example.test/cow.jpg", "img_1")), testEnv);
   assert.equal(response.status, 200);
-  const reply = [...db.replies.values()].find((candidate) => candidate.status === "pending");
+  const reply = pendingReplies(testEnv, threadId)[0];
   assert.equal(reply?.body, "");
   assert.deepEqual(JSON.parse(String(reply?.media)), [{ url: "https://cdn.example.test/cow.jpg" }]);
   assert.equal(reply?.media_group_id, "img");
@@ -801,13 +721,10 @@ test("image-only sendblue webhook creates a pending media reply after quiet wind
     reply.created_at = "2026-04-25T18:30:00.000Z";
   }
 
-  const pending = await handleRequest(req(`/threads/${threadId}/pending`, {
-    headers: { authorization: "Bearer dev-token" },
-  }), testEnv);
-  const body = await json(pending) as { replies: Array<{ body: string; media: Array<{ url: string }> }> };
-  assert.equal(body.replies.length, 1);
-  assert.equal(body.replies[0]?.body, "");
-  assert.deepEqual(body.replies[0]?.media, [{ url: "https://cdn.example.test/cow.jpg" }]);
+  const replies = pendingReplies(testEnv, threadId);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0]?.body, "");
+  assert.deepEqual(JSON.parse(String(replies[0]?.media)), [{ url: "https://cdn.example.test/cow.jpg" }]);
 });
 
 test("text plus image webhook stores both body and media", async () => {
@@ -817,7 +734,7 @@ test("text plus image webhook stores both body and media", async () => {
   await handleRequest(sendblueWebhook(inboundMessage(String(db.threads.get(threadId)?.pairing_code), "pair_msg_1")), testEnv);
 
   await handleRequest(sendblueWebhook(inboundImage("What is this?", "https://cdn.example.test/photo.png", "img_2")), testEnv);
-  const reply = [...db.replies.values()].find((candidate) => candidate.status === "pending");
+  const reply = pendingReplies(testEnv, threadId)[0];
   assert.equal(reply?.body, "What is this?");
   assert.deepEqual(JSON.parse(String(reply?.media)), [{ url: "https://cdn.example.test/photo.png" }]);
 });
@@ -830,28 +747,13 @@ test("multi-image sendblue webhooks claim as one grouped reply after quiet windo
   await handleRequest(sendblueWebhook(inboundImage("Compare these", "https://cdn.example.test/one.png", "group_1")), testEnv);
   await handleRequest(sendblueWebhook(inboundImage("", "https://cdn.example.test/two.png", "group_2")), testEnv);
 
-  const freshPending = await handleRequest(req(`/threads/${threadId}/pending`, {
-    headers: { authorization: "Bearer dev-token" },
-  }), testEnv);
-  assert.deepEqual((await json(freshPending)).replies, []);
+  assert.equal(pendingReplies(testEnv, threadId).length, 2);
 
-  for (const reply of db.replies.values()) {
-    if (reply.status === "pending") {
-      reply.created_at = reply.media_index === 1 ? "2026-04-25T18:30:00.000Z" : "2026-04-25T18:30:01.000Z";
-    }
+  for (const reply of pendingReplies(testEnv, threadId)) {
+    reply.created_at = reply.media_index === 1 ? "2026-04-25T18:30:00.000Z" : "2026-04-25T18:30:01.000Z";
   }
 
-  const pending = await handleRequest(req(`/threads/${threadId}/pending`, {
-    headers: { authorization: "Bearer dev-token" },
-  }), testEnv);
-  const pendingBody = await json(pending) as { replies: Array<{ id: string; body: string; media: Array<{ url: string }> }> };
-  assert.equal(pendingBody.replies.length, 1);
-  assert.equal(pendingBody.replies[0]?.body, "Compare these");
-  assert.deepEqual(pendingBody.replies[0]?.media, [
-    { url: "https://cdn.example.test/one.png" },
-    { url: "https://cdn.example.test/two.png" },
-  ]);
-  const firstReplyId = pendingBody.replies[0]?.id;
+  const firstReplyId = pendingReplies(testEnv, threadId).find((reply) => reply.media_index === 1)?.id;
   assert.equal(typeof firstReplyId, "string");
 
   const originalFetch = globalThis.fetch;
@@ -868,7 +770,7 @@ test("multi-image sendblue webhooks claim as one grouped reply after quiet windo
       { url: "https://cdn.example.test/one.png" },
       { url: "https://cdn.example.test/two.png" },
     ]);
-    const tombstones = [...db.replies.values()].filter((reply) => reply.media_group_id === "group");
+    const tombstones = relayReplies(testEnv).filter((reply) => reply.media_group_id === "group");
     assert.deepEqual(tombstones.map((reply) => ({ status: reply.status, body: reply.body, media: reply.media })), [
       { status: "applied", body: "", media: null },
       { status: "applied", body: "", media: null },
@@ -887,9 +789,9 @@ test("list and numeric switching remain text-only when media is attached", async
   await handleRequest(sendblueWebhook(inboundImage("list", "https://cdn.example.test/list.png", "media_list")), testEnv);
   await handleRequest(sendblueWebhook(inboundImage("1", "https://cdn.example.test/one.png", "media_number")), testEnv);
 
-  const pendingReplies = [...db.replies.values()].filter((reply) => reply.status === "pending");
-  assert.equal(pendingReplies.length, 2);
-  assert.deepEqual(pendingReplies.map((reply) => reply.body), ["list", "1"]);
+  const replies = pendingReplies(testEnv, threadId);
+  assert.equal(replies.length, 2);
+  assert.deepEqual(replies.map((reply) => reply.body), ["list", "1"]);
 });
 
 test("starting another thread for a paired user makes it active", async () => {
@@ -930,14 +832,8 @@ test("starting another thread for a paired user makes it active", async () => {
   assert.equal(db.threads.get(secondThreadId)?.pairing_code, null);
 
   await handleRequest(sendblueWebhook(inboundMessage("Use the new one", "msg_2")), testEnv);
-  const firstPending = await handleRequest(req(`/threads/${firstThreadId}/pending`, {
-    headers: { authorization: "Bearer dev-token" },
-  }), testEnv);
-  const secondPending = await handleRequest(req(`/threads/${secondThreadId}/pending`, {
-    headers: { authorization: "Bearer dev-token" },
-  }), testEnv);
-  assert.deepEqual((await json(firstPending)).replies, []);
-  assert.equal(((await json(secondPending)) as { replies: unknown[] }).replies.length, 1);
+  assert.equal(pendingReplies(testEnv, firstThreadId).length, 0);
+  assert.equal(pendingReplies(testEnv, secondThreadId).length, 1);
 });
 
 test("list command returns numbered enabled threads without status labels", async () => {
@@ -969,7 +865,7 @@ test("list command returns numbered enabled threads without status labels", asyn
       "Remote threads:\n\n1. Second (current)\n2. Remote test\n\nReply with a number to switch.",
     ]);
     assert.doesNotMatch(String(calls[0]?.content), /enabled|stopped/i);
-    const pending = [...db.replies.values()].filter((reply) => reply.status === "pending");
+    const pending = pendingReplies(testEnv);
     assert.deepEqual(pending, []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1017,7 +913,7 @@ test("normal text reports when there is no active thread to forward to", async (
     const response = await handleRequest(sendblueWebhook(inboundMessage("What is 2 + 2?", "msg_no_thread")), testEnv);
     assert.equal(response.status, 200);
     assert.deepEqual(calls.map((call) => call.content), ["You have no remote codex threads"]);
-    const pending = [...db.replies.values()].filter((reply) => reply.status === "pending");
+    const pending = pendingReplies(testEnv);
     assert.deepEqual(pending, []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1053,14 +949,8 @@ test("number command switches the active thread using the current list order", a
     assert.deepEqual(calls.map((call) => call.content), ['Switched to "Remote test".']);
 
     await handleRequest(sendblueWebhook(inboundMessage("Now use the first thread", "msg_2")), testEnv);
-    const firstPending = await handleRequest(req(`/threads/${firstThreadId}/pending`, {
-      headers: { authorization: "Bearer dev-token" },
-    }), testEnv);
-    const secondPending = await handleRequest(req(`/threads/${secondThreadId}/pending`, {
-      headers: { authorization: "Bearer dev-token" },
-    }), testEnv);
-    assert.equal(((await json(firstPending)) as { replies: unknown[] }).replies.length, 1);
-    assert.deepEqual((await json(secondPending)).replies, []);
+    assert.equal(pendingReplies(testEnv, firstThreadId).length, 1);
+    assert.equal(pendingReplies(testEnv, secondThreadId).length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1084,10 +974,7 @@ test("out-of-range number command does not change the active thread or enqueue a
     assert.equal(response.status, 200);
     assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, threadId);
     assert.deepEqual(calls.map((call) => call.content), ["Text threads to see active remote threads."]);
-    const pending = await handleRequest(req(`/threads/${threadId}/pending`, {
-      headers: { authorization: "Bearer dev-token" },
-    }), testEnv);
-    assert.deepEqual((await json(pending)).replies, []);
+    assert.deepEqual(pendingReplies(testEnv, threadId), []);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1173,11 +1060,7 @@ test("duplicate sendblue message handles are ignored", async () => {
   await handleRequest(sendblueWebhook(inboundMessage("once", "msg_2")), testEnv);
   await handleRequest(sendblueWebhook(inboundMessage("twice", "msg_2")), testEnv);
 
-  const pending = await handleRequest(req(`/threads/${threadId}/pending`, {
-    headers: { authorization: "Bearer dev-token" },
-  }), testEnv);
-  const body = await json(pending) as { replies: Array<{ body: string }> };
-  assert.deepEqual(body.replies.map((reply) => reply.body), ["once"]);
+  assert.deepEqual(pendingReplies(testEnv, threadId).map((reply) => reply.body), ["once"]);
 });
 
 test("bad sendblue webhook secret is rejected", async () => {
@@ -1207,19 +1090,16 @@ test("sendblue webhook ignores outbound non-received and empty events", async ()
   assert.equal(empty.status, 200);
 });
 
-test("lists pending replies from paired Sendblue texts", async () => {
+test("enqueues replies from paired Sendblue texts", async () => {
   const testEnv = env();
   const threadId = await register(testEnv);
   const db = testEnv.DB as unknown as FakeD1Database;
   await handleRequest(sendblueWebhook(inboundMessage(String(db.threads.get(threadId)?.pairing_code), "pair_msg_1")), testEnv);
   await handleRequest(sendblueWebhook(inboundMessage("Append a line", "msg_2")), testEnv);
 
-  const pending = await handleRequest(req(`/threads/${threadId}/pending`, {
-    headers: { authorization: "Bearer dev-token" },
-  }), testEnv);
-  const body = await json(pending) as { replies: Array<{ id: string; body: string }> };
-  assert.equal(body.replies.length, 1);
-  assert.equal(body.replies[0]?.body, "Append a line");
+  const replies = pendingReplies(testEnv, threadId);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0]?.body, "Append a line");
 });
 
 test("claims a pending reply exactly once", async () => {
@@ -1228,7 +1108,7 @@ test("claims a pending reply exactly once", async () => {
   const db = testEnv.DB as unknown as FakeD1Database;
   await handleRequest(sendblueWebhook(inboundMessage(String(db.threads.get(threadId)?.pairing_code), "pair_msg_1")), testEnv);
   await handleRequest(sendblueWebhook(inboundMessage("Do it once", "msg_2")), testEnv);
-  const replyId = [...db.replies.values()].find((reply) => reply.status === "pending")?.id;
+  const replyId = pendingReplies(testEnv, threadId)[0]?.id;
   assert.equal(typeof replyId, "string");
 
   const originalFetch = globalThis.fetch;
@@ -1261,11 +1141,7 @@ test("claims a pending reply exactly once", async () => {
     }), testEnv);
     assert.equal(duplicate.status, 409);
 
-    const pending = await handleRequest(req(`/threads/${threadId}/pending`, {
-      headers: { authorization: "Bearer dev-token" },
-    }), testEnv);
-    const body = await json(pending) as { replies: unknown[] };
-    assert.deepEqual(body.replies, []);
+    assert.deepEqual(pendingReplies(testEnv, threadId), []);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1750,7 +1626,7 @@ test("sendblue response without a message handle returns notification error", as
 test("rejects requests with the wrong thread token", async () => {
   const testEnv = env();
   const threadId = await register(testEnv);
-  const response = await handleRequest(req(`/threads/${threadId}/pending`, {
+  const response = await handleRequest(req(`/threads/${threadId}`, {
     headers: { authorization: "Bearer wrong-token" },
   }), testEnv);
   assert.equal(response.status, 401);
