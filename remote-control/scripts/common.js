@@ -75,9 +75,9 @@ function readConfig() {
 }
 
 async function ensureLocalInstall() {
-  // This repairs hook/config details for an already configured install. First
-  // use must go through the skill's relay choice and hook consent prompts before
-  // this script runs.
+  // First use goes through the skill's relay choice and hook consent prompts
+  // before this script runs. Starting remote only ensures relay config exists;
+  // it does not rewrite hook setup.
   const existingConfig = existsSync(configPath) ? readJson(configPath) : null;
   if (!existingConfig && !(process.env.REMOTE_CONTROL_API_BASE_URL && process.env.REMOTE_CONTROL_TOKEN)) {
     throw new Error("Remote Control is not configured yet. Choose the hosted relay or provide your self-hosted relay URL before starting remote.");
@@ -94,12 +94,7 @@ async function ensureLocalInstall() {
     token,
     stopWaitSeconds: readNumber(existingConfig?.stopWaitSeconds, process.env.REMOTE_CONTROL_STOP_WAIT_SECONDS, 86400),
   });
-  const codexHooksChanged = ensureCodexHooksEnabled(path.join(codexHome(), "config.toml"));
-  const stopHookChanged = installStopHook(path.join(codexHome(), "hooks.json"), skillDir);
-  return {
-    ...readConfig(),
-    hookSetupChanged: codexHooksChanged || stopHookChanged,
-  };
+  return readConfig();
 }
 
 async function createInstallToken(apiBaseUrl) {
@@ -147,19 +142,7 @@ function remoteStopHookCommand(targetSkillDir) {
   ].join(" ");
 }
 
-function isDesiredRemoteStopHook(hook, targetSkillDir) {
-  return Boolean(
-    hook
-    && typeof hook === "object"
-    && hook.type === "command"
-    && hook.command === remoteStopHookCommand(targetSkillDir)
-    && hook.timeout === remoteStopHookTimeoutSeconds
-    && hook.statusMessage === remoteStopHookStatusMessage
-    && hook.silent === true
-  );
-}
-
-function hasDesiredStopHook(hooksPath, targetSkillDir) {
+function hasRemoteControlStopHook(hooksPath) {
   if (!existsSync(hooksPath)) {
     return false;
   }
@@ -171,7 +154,7 @@ function hasDesiredStopHook(hooksPath, targetSkillDir) {
       && typeof group === "object"
       && Array.isArray(group.hooks)
       && group.hooks.some(function hasHook(hook) {
-        return isDesiredRemoteStopHook(hook, targetSkillDir);
+        return hook && typeof hook === "object" && isRemoteControlStopHook(hook.command);
       });
   });
 }
@@ -180,7 +163,7 @@ function remoteControlHookStatus(codexHomePath, targetSkillDir) {
   const configFilePath = path.join(codexHomePath, "config.toml");
   const hooksPath = path.join(codexHomePath, "hooks.json");
   const codexHooksEnabled = areCodexHooksEnabled(configFilePath);
-  const stopHookInstalled = hasDesiredStopHook(hooksPath, targetSkillDir);
+  const stopHookInstalled = hasRemoteControlStopHook(hooksPath);
   return {
     codexHooksEnabled,
     stopHookInstalled,
@@ -191,63 +174,28 @@ function remoteControlHookStatus(codexHomePath, targetSkillDir) {
 }
 
 function installStopHook(hooksPath, targetSkillDir) {
+  if (hasRemoteControlStopHook(hooksPath)) {
+    return false;
+  }
+
   const root = existsSync(hooksPath) ? readJson(hooksPath) : {};
-  const before = JSON.stringify(root);
   const hooks = root.hooks && typeof root.hooks === "object" && !Array.isArray(root.hooks) ? root.hooks : {};
   const groups = Array.isArray(hooks.Stop) ? hooks.Stop : [];
   const command = remoteStopHookCommand(targetSkillDir);
 
-  let found = false;
-  for (const group of groups) {
-    if (!group || typeof group !== "object" || !Array.isArray(group.hooks)) {
-      continue;
-    }
-    for (const hook of group.hooks) {
-      if (!hook || typeof hook !== "object") {
-        continue;
-      }
-      if (isRemoteControlStopHook(hook.command)) {
-        if (
-          hook.type !== "command"
-          || hook.command !== command
-          || hook.timeout !== remoteStopHookTimeoutSeconds
-          || hook.statusMessage !== remoteStopHookStatusMessage
-          || hook.silent !== true
-        ) {
-          hook.type = "command";
-          hook.command = command;
-          hook.timeout = remoteStopHookTimeoutSeconds;
-          hook.statusMessage = remoteStopHookStatusMessage;
-          hook.silent = true;
-        }
-        found = true;
-      }
-    }
-  }
-
-  let changed = false;
-  if (!found) {
-    groups.push({
-      hooks: [{
-        type: "command",
-        command,
-        timeout: remoteStopHookTimeoutSeconds,
-        statusMessage: remoteStopHookStatusMessage,
-        silent: true,
-      }],
-    });
-    changed = true;
-  }
-
+  groups.push({
+    hooks: [{
+      type: "command",
+      command,
+      timeout: remoteStopHookTimeoutSeconds,
+      statusMessage: remoteStopHookStatusMessage,
+      silent: true,
+    }],
+  });
   hooks.Stop = groups;
   root.hooks = hooks;
-  if (JSON.stringify(root) !== before) {
-    changed = true;
-  }
-  if (changed) {
-    writeJson(hooksPath, root);
-  }
-  return changed;
+  writeJson(hooksPath, root);
+  return true;
 }
 
 function isRemoteControlStopHook(command) {
@@ -541,7 +489,7 @@ module.exports = {
   ensureLocalInstall,
   ensureCodexHooksEnabled,
   ensureStateDirs,
-  hasDesiredStopHook,
+  hasRemoteControlStopHook,
   installStopHook,
   isUsableThreadTitle,
   readActiveThreads,

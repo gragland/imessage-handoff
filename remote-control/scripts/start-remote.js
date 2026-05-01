@@ -82,13 +82,10 @@ async function main() {
   ].join(" ");
 
   const sendblueNumberDisplay = formatPhoneNumber(registrationResult.sendblueNumber);
-  const hookRestartHint = config.hookSetupChanged
-    ? " If Codex does not wait for replies after this message, restart Codex once."
-    : "";
   const localMessage = registrationResult.pairingRequired
     // First install: user must text this code once so the relay can bind phone
     // number -> local install token owner.
-    ? `Remote control is enabled. Text \`${registrationResult.pairingCode}\` to \`${sendblueNumberDisplay}\` to continue this thread from iMessage.${hookRestartHint}`
+    ? `Remote control is enabled. Text \`${registrationResult.pairingCode}\` to \`${sendblueNumberDisplay}\` to continue this thread from iMessage.`
     // Already paired: starting remote switches the paired phone to this thread.
     : `Remote control is enabled. Text \`${sendblueNumberDisplay}\` to talk to Codex.`;
 

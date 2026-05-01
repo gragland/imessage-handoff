@@ -61,7 +61,7 @@ After the user confirms, run `node scripts/configure.js install-hook`, then repl
 Remote Control hook is installed. Restart Codex once, then invoke `$remote-control` again to start remote control.
 ```
 
-Do not run `scripts/start-remote.js` in the same turn that installs or repairs the hook. The restart lets Codex load the new hook before the pairing message is shown, so the Stop hook can wait for the iMessage reply.
+Do not run `scripts/start-remote.js` in the same turn that installs the hook. The restart lets Codex load the new hook before the pairing message is shown, so the Stop hook can wait for the iMessage reply.
 
 Once relay config exists and `node scripts/configure.js hook-status` reports `ready: true`:
 
@@ -71,7 +71,7 @@ Once relay config exists and `node scripts/configure.js hook-status` reports `re
    - Summarize the work itself, not the setup or delivery mechanism.
    - Keep it plain text and very short, ideally under 140 characters.
    - If there is not enough useful context, use no summary.
-2. Run the bundled `scripts/start-remote.js` from this skill's installed directory with `--handoff-summary="SUMMARY"` when you have a useful summary, or with no arguments when you do not. This registers the thread and installs or repairs the Codex Stop hook after consent.
+2. Run the bundled `scripts/start-remote.js` from this skill's installed directory with `--handoff-summary="SUMMARY"` when you have a useful summary, or with no arguments when you do not. This registers the thread.
 3. Use Node to run the script, for example `node scripts/start-remote.js` after resolving `scripts/start-remote.js` relative to this `SKILL.md`.
 4. If that fails with a sandbox or network error such as `fetch failed`, retry with approval using the same command. Do not request escalation before trying the normal command first.
 5. Read the JSON output.

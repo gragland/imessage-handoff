@@ -302,6 +302,40 @@ test("configure install-hook installs once and reports ready status", async () =
   assert.equal(secondOutput.ready, true);
 });
 
+test("configure hook-status accepts an existing Remote Control hook with a different node path", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-config-"));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "remote-control-codex-home-"));
+  const hooksPath = path.join(codexHome, "hooks.json");
+  const existingCommand = "'/usr/local/bin/node' '/Users/gabe/.codex/skills/remote-control/scripts/publish-stop.js'";
+  writeFileSync(path.join(codexHome, "config.toml"), "[features]\ncodex_hooks = true\n");
+  writeFileSync(hooksPath, JSON.stringify({
+    hooks: {
+      Stop: [{
+        hooks: [{
+          type: "command",
+          command: existingCommand,
+          timeout: 86520,
+          statusMessage: "Waiting for remote messages",
+          silent: true,
+        }],
+      }],
+    },
+  }));
+
+  const status = await runScript("configure.js", ["hook-status"], { stateDir, codexHome });
+  assert.equal(status.code, 0, status.stderr);
+  const output = JSON.parse(status.stdout);
+  assert.equal(output.codexHooksEnabled, true);
+  assert.equal(output.stopHookInstalled, true);
+  assert.equal(output.ready, true);
+
+  const install = await runScript("configure.js", ["install-hook"], { stateDir, codexHome });
+  assert.equal(install.code, 0, install.stderr);
+  assert.equal(JSON.parse(install.stdout).hookSetupChanged, false);
+  const hooksRoot = JSON.parse(readFileSync(hooksPath, "utf8"));
+  assert.equal(hooksRoot.hooks.Stop[0].hooks[0].command, existingCommand);
+});
+
 test("publish-stop exits quietly for inactive threads", async () => {
   const stateDir = tempState();
   const result = await runScript("publish-stop.js", [], {
@@ -379,7 +413,7 @@ test("start-remote creates thread and writes active registry", async () => {
   assert.equal(parsed.paired, false);
   assert.equal(parsed.pairingRequired, true);
   assert.equal(parsed.pairingCode, "ABC123");
-  assert.equal(parsed.localMessage, "Remote control is enabled. Text `ABC123` to `+1 (234) 419-8201` to continue this thread from iMessage. If Codex does not wait for replies after this message, restart Codex once.");
+  assert.equal(parsed.localMessage, "Remote control is enabled. Text `ABC123` to `+1 (234) 419-8201` to continue this thread from iMessage.");
   assert.match(parsed.statusCurlCommand, /curl -sS/);
   assert.match(parsed.statusCurlCommand, /\/threads\/codex-thread-1/);
   const active = JSON.parse(readFileSync(path.join(stateDir, "active-threads.json"), "utf8"));
@@ -395,11 +429,7 @@ test("start-remote creates thread and writes active registry", async () => {
   assert.equal("title" in mock.calls[0].body, false);
   assert.equal(mock.calls[0].body.handoffSummary, "You were deciding what to prototype next.");
 
-  const hooksRoot = JSON.parse(readFileSync(path.join(codexHome, "hooks.json"), "utf8"));
-  const stopHook = hooksRoot.hooks.Stop[0].hooks[0];
-  assert.equal(stopHook.type, "command");
-  assert.match(stopHook.command, /publish-stop\.js/);
-  assert.equal(stopHook.statusMessage, "Waiting for remote messages");
+  assert.equal(existsSync(path.join(codexHome, "hooks.json")), false);
 });
 
 test("start-remote omits restart hint when hook setup is unchanged", async () => {
