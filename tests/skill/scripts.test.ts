@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -11,8 +11,8 @@ const scriptsDir = path.resolve("skill/scripts");
 // These tests execute the installed skill scripts the same way Codex hooks do.
 // Most network calls are routed through a mock file so the tests can verify the
 // local state machine without needing a live relay or Sendblue account.
-function scriptEnv(options: { stateDir: string; mockFile?: string; codexThreadId?: string; stateDb?: string; sessionLog?: string; globalState?: string; codexHome?: string }) {
-  return {
+function scriptEnv(options: { stateDir: string; mockFile?: string; codexThreadId?: string; stateDb?: string; sessionLog?: string; globalState?: string; codexHome?: string; relayUrl?: string }) {
+  const env = {
     ...process.env,
     CODEX_HOME: options.codexHome ?? path.join(options.stateDir, "codex-home"),
     CODEX_THREAD_ID: options.codexThreadId ?? "",
@@ -23,9 +23,13 @@ function scriptEnv(options: { stateDir: string; mockFile?: string; codexThreadId
     REMOTE_CONTROL_SESSION_LOG: options.sessionLog ?? "",
     REMOTE_CONTROL_GLOBAL_STATE_PATH: options.globalState ?? "",
   };
+  if (options.relayUrl) {
+    env.REMOTE_CONTROL_RELAY_URL = options.relayUrl;
+  }
+  return env;
 }
 
-function runScript(scriptName: string, args: string[], options: { stateDir: string; stdin?: string; mockFile?: string; codexThreadId?: string; stateDb?: string; sessionLog?: string; globalState?: string; codexHome?: string }) {
+function runScript(scriptName: string, args: string[], options: { stateDir: string; stdin?: string; mockFile?: string; codexThreadId?: string; stateDb?: string; sessionLog?: string; globalState?: string; codexHome?: string; relayUrl?: string }) {
   return new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawn(process.execPath, [path.join(scriptsDir, scriptName), ...args], {
       cwd: path.resolve("."),
@@ -194,6 +198,20 @@ test("remote-control uninstall removes empty Stop groups", () => {
   assert.equal("Stop" in hooksRoot.hooks, false);
 });
 
+test("remote-control install copies the skill without creating relay config or hooks", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "remote-control-codex-home-"));
+  const result = runCli(["install", "--codex-home=" + codexHome]);
+  assert.equal(result.status, 0, result.stderr);
+
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.ok, true);
+  assert.equal(output.configured, false);
+  assert.equal(output.hookInstalled, false);
+  assert.equal(existsSync(path.join(codexHome, "skills", "remote-control", "SKILL.md")), true);
+  assert.equal(existsSync(path.join(codexHome, "skills", "remote-control", ".state", "config.json")), false);
+  assert.equal(existsSync(path.join(codexHome, "hooks.json")), false);
+});
+
 test("configure sets a self-hosted relay and redacts config output", async () => {
   await withInstallRelay(async (relayUrl) => {
     const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-config-"));
@@ -214,6 +232,25 @@ test("configure sets a self-hosted relay and redacts config output", async () =>
     const showOutput = JSON.parse(show.stdout);
     assert.equal(showOutput.configured, true);
     assert.equal(showOutput.config.token, "<redacted>");
+  });
+});
+
+test("configure use-default-relay creates hosted relay config", async () => {
+  await withInstallRelay(async (relayUrl) => {
+    const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-config-"));
+    const result = await runScript("configure.js", ["use-default-relay"], { stateDir, relayUrl });
+    assert.equal(result.code, 0, result.stderr);
+
+    const config = JSON.parse(readFileSync(path.join(stateDir, "config.json"), "utf8"));
+    assert.equal(config.apiBaseUrl, relayUrl);
+    assert.equal(config.token, "relay-token");
+    assert.equal(config.stopWaitSeconds, 86400);
+
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.ok, true);
+    assert.equal(output.tokenCreated, true);
+    assert.equal(output.config.apiBaseUrl, relayUrl);
+    assert.equal(output.config.token, "<redacted>");
   });
 });
 
@@ -254,12 +291,12 @@ test("start-remote requires CODEX_THREAD_ID", async () => {
   assert.match(result.stderr, /CODEX_THREAD_ID is required/);
 });
 
-test("start-remote bootstraps config and Stop hook on first invoke", async () => {
+test("start-remote requires relay config before installing the Stop hook", async () => {
   const mockPath = mockFile({
     "POST /threads/codex-thread-1": {
       body: {
         id: "codex-thread-1",
-        sendblueNumber: "+16452468235",
+        sendblueNumber: "+12344198201",
         paired: false,
         pairingRequired: true,
         pairingCode: "ABC123",
@@ -276,24 +313,13 @@ test("start-remote bootstraps config and Stop hook on first invoke", async () =>
     mockFile: mockPath,
     codexThreadId: "codex-thread-1",
   });
-  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Choose the hosted relay or provide your self-hosted relay URL/);
+  assert.equal(existsSync(path.join(stateDir, "config.json")), false);
+  assert.equal(existsSync(path.join(codexHome, "hooks.json")), false);
 
-  const config = JSON.parse(readFileSync(path.join(stateDir, "config.json"), "utf8"));
-  assert.equal(config.token, "dev-token");
-  assert.equal(config.stopWaitSeconds, 86400);
-  assert.match(config.apiBaseUrl, /^https:\/\/remote-control\.gabe-ragland\.workers\.dev$/);
-
-  const codexConfig = readFileSync(path.join(codexHome, "config.toml"), "utf8");
-  assert.match(codexConfig, /codex_hooks = true/);
-
-  const hooksRoot = JSON.parse(readFileSync(path.join(codexHome, "hooks.json"), "utf8"));
-  const stopHook = hooksRoot.hooks.Stop[0].hooks[0];
-  assert.equal(stopHook.type, "command");
-  assert.match(stopHook.command, /publish-stop\.js/);
-  assert.equal(stopHook.statusMessage, "Waiting for remote messages");
-
-  const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.localMessage, "Remote control is enabled. Text `ABC123` to `+1 (645) 246-8235` to continue this thread from iMessage.");
+  const mock = JSON.parse(readFileSync(mockPath, "utf8"));
+  assert.equal(mock.calls.length, 0);
 });
 
 test("start-remote creates thread and writes active registry", async () => {
@@ -301,7 +327,7 @@ test("start-remote creates thread and writes active registry", async () => {
     "POST /threads/codex-thread-1": {
       body: {
         id: "codex-thread-1",
-        sendblueNumber: "+16452468235",
+        sendblueNumber: "+12344198201",
         paired: false,
         pairingRequired: true,
         pairingCode: "ABC123",
@@ -310,21 +336,22 @@ test("start-remote creates thread and writes active registry", async () => {
     },
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "remote-control-codex-home-"));
   writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ apiBaseUrl: "https://example.test", token: "dev-token" }));
 
   const result = await runScript("start-remote.js", [
     "--cwd=/tmp/project",
     "--handoff-summary=You were deciding what to prototype next.",
-  ], { stateDir, mockFile: mockPath, codexThreadId: "codex-thread-1" });
+  ], { stateDir, codexHome, mockFile: mockPath, codexThreadId: "codex-thread-1" });
   assert.equal(result.code, 0);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.codexThreadId, "codex-thread-1");
-  assert.equal(parsed.sendblueNumber, "+16452468235");
-  assert.equal(parsed.sendblueNumberDisplay, "+1 (645) 246-8235");
+  assert.equal(parsed.sendblueNumber, "+12344198201");
+  assert.equal(parsed.sendblueNumberDisplay, "+1 (234) 419-8201");
   assert.equal(parsed.paired, false);
   assert.equal(parsed.pairingRequired, true);
   assert.equal(parsed.pairingCode, "ABC123");
-  assert.equal(parsed.localMessage, "Remote control is enabled. Text `ABC123` to `+1 (645) 246-8235` to continue this thread from iMessage.");
+  assert.equal(parsed.localMessage, "Remote control is enabled. Text `ABC123` to `+1 (234) 419-8201` to continue this thread from iMessage.");
   assert.match(parsed.statusCurlCommand, /curl -sS/);
   assert.match(parsed.statusCurlCommand, /\/threads\/codex-thread-1/);
   const active = JSON.parse(readFileSync(path.join(stateDir, "active-threads.json"), "utf8"));
@@ -339,6 +366,12 @@ test("start-remote creates thread and writes active registry", async () => {
   assert.equal(mock.calls[0].body.cwd, "/tmp/project");
   assert.equal("title" in mock.calls[0].body, false);
   assert.equal(mock.calls[0].body.handoffSummary, "You were deciding what to prototype next.");
+
+  const hooksRoot = JSON.parse(readFileSync(path.join(codexHome, "hooks.json"), "utf8"));
+  const stopHook = hooksRoot.hooks.Stop[0].hooks[0];
+  assert.equal(stopHook.type, "command");
+  assert.match(stopHook.command, /publish-stop\.js/);
+  assert.equal(stopHook.statusMessage, "Waiting for remote messages");
 });
 
 test("start-remote uses the Codex sidebar title from the local state db", async () => {
@@ -349,7 +382,7 @@ test("start-remote uses the Codex sidebar title from the local state db", async 
     "POST /threads/codex-thread-1": {
       body: {
         id: "codex-thread-1",
-        sendblueNumber: "+16452468235",
+        sendblueNumber: "+12344198201",
         paired: true,
         pairingRequired: false,
         pairingCode: null,
@@ -367,7 +400,7 @@ test("start-remote uses the Codex sidebar title from the local state db", async 
   });
   assert.equal(result.code, 0);
   const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.localMessage, "Remote control is enabled. Text `+1 (645) 246-8235` to talk to Codex.");
+  assert.equal(parsed.localMessage, "Remote control is enabled. Text `+1 (234) 419-8201` to talk to Codex.");
   const active = JSON.parse(readFileSync(path.join(stateDir, "active-threads.json"), "utf8"));
   assert.equal(active.threads["codex-thread-1"].skipNextStatusSend, true);
   const mock = JSON.parse(readFileSync(mockPath, "utf8"));
@@ -383,7 +416,7 @@ test("start-remote sends normalized skill-link titles", async () => {
     "POST /threads/codex-thread-1": {
       body: {
         id: "codex-thread-1",
-        sendblueNumber: "+16452468235",
+        sendblueNumber: "+12344198201",
         paired: true,
         pairingRequired: false,
         pairingCode: null,
@@ -412,7 +445,7 @@ test("start-remote allows activation-only titles", async () => {
     "POST /threads/codex-thread-1": {
       body: {
         id: "codex-thread-1",
-        sendblueNumber: "+16452468235",
+        sendblueNumber: "+12344198201",
         paired: true,
         pairingRequired: false,
         pairingCode: null,
@@ -438,7 +471,7 @@ test("start-remote omits empty handoff summaries", async () => {
     "POST /threads/codex-thread-1": {
       body: {
         id: "codex-thread-1",
-        sendblueNumber: "+16452468235",
+        sendblueNumber: "+12344198201",
         paired: true,
         pairingRequired: false,
         pairingCode: null,
@@ -463,7 +496,7 @@ test("start-remote resets local activation time when re-enabling a thread", asyn
     "POST /threads/codex-thread-1": {
       body: {
         id: "codex-thread-1",
-        sendblueNumber: "+16452468235",
+        sendblueNumber: "+12344198201",
         paired: true,
         pairingRequired: false,
         pairingCode: null,
@@ -717,6 +750,8 @@ test("publish-stop claims a remote reply and emits a block decision", async () =
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.decision, "block");
   assert.match(parsed.reason, /Local display block to render:\n\*\*Remote message\*\*\n> What is 2 \+ 2\?/);
+  assert.match(parsed.reason, /send-update\.js' --thread-id='codex-thread-1' --message='Brief progress update here'/);
+  assert.match(parsed.reason, /very brief progress update every few minutes/);
   assert.match(parsed.reason, /Start your assistant response with the local display block/);
   assert.match(parsed.reason, /User message to answer:\nWhat is 2 \+ 2\?/);
   assert.doesNotMatch(parsed.reason, /empty response/);
@@ -728,6 +763,39 @@ test("publish-stop claims a remote reply and emits a block decision", async () =
     "POST /threads/codex-thread-1/replies/reply_1/claim",
   ]);
   assert.equal(updatedMock.calls[1].body, null);
+});
+
+test("send-update publishes a working status without exposing auth", async () => {
+  const mockPath = mockFile({
+    "POST /threads/codex-thread-1/status": {
+      body: { ok: true, notification: { sent: true, status: "QUEUED", messageHandle: "message-1" } },
+    },
+  });
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "remote-control-test-"));
+  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({
+    apiBaseUrl: "https://example.test",
+    token: "dev-token",
+  }));
+
+  const result = await runScript("send-update.js", [
+    "--thread-id=codex-thread-1",
+    "--message=Still working through the implementation and tests.",
+  ], { stateDir, mockFile: mockPath });
+  assert.equal(result.code, 0, result.stderr);
+
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.ok, true);
+  assert.equal(output.notification.messageHandle, "message-1");
+
+  const mock = JSON.parse(readFileSync(mockPath, "utf8"));
+  assert.equal(mock.calls[0].authorization, "Bearer <redacted>");
+  assert.deepEqual(mock.calls[0].body, {
+    cwd: path.resolve("."),
+    lastAssistantMessage: "Still working through the implementation and tests.",
+    status: "working",
+    createdAt: mock.calls[0].body.createdAt,
+  });
+  assert.match(mock.calls[0].body.createdAt, /^\d{4}-\d{2}-\d{2}T/);
 });
 
 test("publish-stop claims websocket replies by id", async () => {
@@ -1248,7 +1316,7 @@ test("publish-stop skips the local start-remote activation status once", async (
     stdin: JSON.stringify({
       session_id: "codex-thread-1",
       cwd: "/tmp/project",
-      last_assistant_message: "Remote control is enabled. Text `+1 (645) 246-8235` to talk to Codex.",
+      last_assistant_message: "Remote control is enabled. Text `+1 (234) 419-8201` to talk to Codex.",
     }),
   });
   assert.equal(result.code, 0);

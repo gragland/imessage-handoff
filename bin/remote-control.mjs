@@ -6,20 +6,11 @@ import { fileURLToPath } from "node:url";
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const skillSourceDir = path.join(packageDir, "skill");
-const defaultRelayUrl = process.env.REMOTE_CONTROL_RELAY_URL || "https://remote-control.gabe-ragland.workers.dev";
-// Codex Stop hooks need a long timeout because they intentionally wait for the
-// user's next remote iMessage after each assistant turn.
-const remoteStopHookTimeoutSeconds = 86520;
-const remoteStopHookStatusMessage = "Waiting for remote messages";
 
 function readArg(name) {
   const prefix = `--${name}=`;
   const arg = process.argv.find((value) => value.startsWith(prefix));
   return arg ? arg.slice(prefix.length) : "";
-}
-
-function shellQuote(value) {
-  return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
 function readJson(filePath, fallback) {
@@ -34,45 +25,6 @@ function writeJson(filePath, value) {
   const tempPath = `${filePath}.tmp-${process.pid}`;
   writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
   renameSync(tempPath, filePath);
-}
-
-function writeText(filePath, value) {
-  mkdirSync(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.tmp-${process.pid}`;
-  writeFileSync(tempPath, value, "utf8");
-  renameSync(tempPath, filePath);
-}
-
-function normalizeRelayUrl(value) {
-  return String(value || "").replace(/\/+$/, "");
-}
-
-async function createInstallToken(apiBaseUrl) {
-  // The relay gives each install a bearer token. That token becomes the local
-  // identity later linked to the user's phone during pairing.
-  const response = await fetch(`${apiBaseUrl}/installations`, { method: "POST" });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok || typeof body.token !== "string" || !body.token.trim()) {
-    throw new Error(`Remote Control relay did not return an install token from ${apiBaseUrl}/installations.`);
-  }
-  return body.token.trim();
-}
-
-function ensureCodexHooksEnabled(configPath) {
-  // Remote Control depends on Codex's Stop hook feature. Preserve the rest of
-  // config.toml and only turn this feature flag on.
-  const current = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
-  let next = current;
-  if (/\[features\][\s\S]*?codex_hooks\s*=/.test(current)) {
-    next = current.replace(/(\[features\][\s\S]*?codex_hooks\s*=\s*)(true|false)/, "$1true");
-  } else if (current.includes("[features]")) {
-    next = current.replace("[features]", "[features]\ncodex_hooks = true");
-  } else {
-    next = `${current.trimEnd()}${current.trim() ? "\n\n" : ""}[features]\ncodex_hooks = true\n`;
-  }
-  if (next !== current) {
-    writeText(configPath, next);
-  }
 }
 
 function installSkill(skillTargetDir, codexHome) {
@@ -92,54 +44,6 @@ function installSkill(skillTargetDir, codexHome) {
     rmSync(path.join(skillTargetDir, ".state"), { recursive: true, force: true });
     renameSync(preservedStatePath, path.join(skillTargetDir, ".state"));
   }
-}
-
-function installStopHook(hooksPath, skillTargetDir) {
-  // Add or update one global Stop hook. It runs after every assistant response
-  // and is what lets an iMessage reply continue the same local Codex thread.
-  const root = readJson(hooksPath, {});
-  const hooks = root.hooks && typeof root.hooks === "object" && !Array.isArray(root.hooks) ? root.hooks : {};
-  const groups = Array.isArray(hooks.Stop) ? hooks.Stop : [];
-  const command = [
-    shellQuote(process.execPath),
-    shellQuote(path.join(skillTargetDir, "scripts", "publish-stop.js")),
-  ].join(" ");
-
-  let found = false;
-  for (const group of groups) {
-    if (!group || typeof group !== "object" || !Array.isArray(group.hooks)) {
-      continue;
-    }
-    for (const hook of group.hooks) {
-      if (!hook || typeof hook !== "object") {
-        continue;
-      }
-      if (typeof hook.command === "string" && hook.command.includes("publish-stop.js")) {
-        hook.type = "command";
-        hook.command = command;
-        hook.timeout = remoteStopHookTimeoutSeconds;
-        hook.statusMessage = remoteStopHookStatusMessage;
-        hook.silent = true;
-        found = true;
-      }
-    }
-  }
-
-  if (!found) {
-    groups.push({
-      hooks: [{
-        type: "command",
-        command,
-        timeout: remoteStopHookTimeoutSeconds,
-        statusMessage: remoteStopHookStatusMessage,
-        silent: true,
-      }],
-    });
-  }
-
-  hooks.Stop = groups;
-  root.hooks = hooks;
-  writeJson(hooksPath, root);
 }
 
 function uninstallStopHook(hooksPath) {
@@ -188,34 +92,21 @@ function uninstallStopHook(hooksPath) {
   return removed;
 }
 
-async function install() {
-  // The installer is intentionally close to the public npx-from-GitHub flow. It
-  // fetches/reuses a token, copies the skill, writes config, and registers hooks.
+function install() {
+  // Keep the npx installer as a lightweight compatibility path. First-use relay
+  // choice and hook installation happen later through the skill conversation.
   const codexHome = readArg("codex-home") || process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
   const skillTargetDir = path.join(codexHome, "skills", "remote-control");
   const configPath = path.join(skillTargetDir, ".state", "config.json");
   const hooksPath = path.join(codexHome, "hooks.json");
-  const codexConfigPath = path.join(codexHome, "config.toml");
   const existingConfig = readJson(configPath, null);
-  const apiBaseUrl = normalizeRelayUrl(existingConfig?.apiBaseUrl || defaultRelayUrl);
-  const canReuseToken = existingConfig
-    && existingConfig.apiBaseUrl === apiBaseUrl
-    && typeof existingConfig.token === "string";
-  const token = canReuseToken ? existingConfig.token : await createInstallToken(apiBaseUrl);
 
-  ensureCodexHooksEnabled(codexConfigPath);
   installSkill(skillTargetDir, codexHome);
-  writeJson(configPath, {
-    apiBaseUrl,
-    token,
-    stopWaitSeconds: Number(existingConfig?.stopWaitSeconds) || 86400,
-  });
-  installStopHook(hooksPath, skillTargetDir);
 
   console.log(JSON.stringify({
     ok: true,
-    apiBaseUrl,
-    tokenCreated: !canReuseToken,
+    configured: Boolean(existingConfig),
+    hookInstalled: false,
     skillPath: skillTargetDir,
     hooksPath,
   }, null, 2));
@@ -240,10 +131,12 @@ if (command !== "install" && command !== "uninstall") {
 }
 
 if (command === "install") {
-  install().catch((error) => {
+  try {
+    install();
+  } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exit(1);
-  });
+  }
 } else {
   try {
     uninstall();

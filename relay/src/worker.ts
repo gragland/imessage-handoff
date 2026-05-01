@@ -451,7 +451,7 @@ async function handleRegister(request: Request, env: Env, threadId: string) {
 
   return json({
     id: threadId,
-    sendblueNumber: env.SENDBLUE_FROM_NUMBER || "+16452468235",
+    sendblueNumber: env.SENDBLUE_FROM_NUMBER || "+12344198201",
     paired: Boolean(existingBinding),
     pairingRequired,
     pairingCode,
@@ -646,6 +646,16 @@ async function sendControlMessage(env: Env, phoneNumber: string, message: string
   }
 }
 
+async function sendReadReceipt(env: Env, phoneNumber: string) {
+  // Best effort: mark the inbound conversation as read as soon as the webhook is
+  // accepted. Failure should not block pairing or prompt delivery.
+  try {
+    await sendSendblueReadReceipt(env, phoneNumber);
+  } catch {
+    console.warn("Sendblue read receipt failed.");
+  }
+}
+
 async function setActiveThreadForOwner(env: Env, ownerId: string, threadId: string | null) {
   await env.DB.prepare(
     "UPDATE phone_bindings SET active_thread_id = ?, updated_at = ? WHERE owner_id = ?",
@@ -812,7 +822,7 @@ async function uploadSendblueMedia(env: Env, image: GeneratedImageInput) {
 }
 
 async function sendSendblueMessage(env: Env, number: string, content: string | null, mediaUrl: string | null = null) {
-  const fromNumber = env.SENDBLUE_FROM_NUMBER?.trim() || "+16452468235";
+  const fromNumber = env.SENDBLUE_FROM_NUMBER?.trim() || "+12344198201";
   const payload: Record<string, string> = {
     number,
     from_number: fromNumber,
@@ -837,7 +847,7 @@ async function sendSendblueMessage(env: Env, number: string, content: string | n
 }
 
 async function sendSendblueCarousel(env: Env, number: string, mediaUrls: string[]) {
-  const fromNumber = env.SENDBLUE_FROM_NUMBER?.trim() || "+16452468235";
+  const fromNumber = env.SENDBLUE_FROM_NUMBER?.trim() || "+12344198201";
 
   const response = await fetch(`${sendblueApiBaseUrl(env)}/send-carousel`, {
     method: "POST",
@@ -882,7 +892,7 @@ async function sendStatusNotification(
 }
 
 async function sendSendblueTypingIndicator(env: Env, number: string) {
-  const fromNumber = env.SENDBLUE_FROM_NUMBER?.trim() || "+16452468235";
+  const fromNumber = env.SENDBLUE_FROM_NUMBER?.trim() || "+12344198201";
   const response = await fetch(`${sendblueApiBaseUrl(env)}/send-typing-indicator`, {
     method: "POST",
     headers: sendblueAuthHeaders(env),
@@ -899,6 +909,22 @@ async function sendSendblueTypingIndicator(env: Env, number: string) {
   const indicatorStatus = isRecord(payload) ? optionalString(payload.status)?.toUpperCase() : null;
   if (indicatorStatus === "ERROR") {
     throw new Error("Sendblue typing indicator failed.");
+  }
+}
+
+async function sendSendblueReadReceipt(env: Env, number: string) {
+  const fromNumber = env.SENDBLUE_FROM_NUMBER?.trim() || "+12344198201";
+  const response = await fetch(`${sendblueApiBaseUrl(env)}/mark-read`, {
+    method: "POST",
+    headers: sendblueAuthHeaders(env),
+    body: JSON.stringify({
+      number,
+      from_number: fromNumber,
+    }),
+  });
+  await readSendblueJson(response);
+  if (!response.ok) {
+    throw new Error(`Sendblue read receipt API returned HTTP ${response.status}.`);
   }
 }
 
@@ -1043,7 +1069,7 @@ function relaySocket(env: Env) {
   return env.REMOTE_THREAD_SOCKET.get(env.REMOTE_THREAD_SOCKET.idFromName("global"));
 }
 
-async function handleSendblueWebhook(request: Request, env: Env) {
+async function handleSendblueWebhook(request: Request, env: Env, ctx?: ExecutionContext) {
   // Sendblue calls this for inbound and outbound events. We only care about
   // inbound RECEIVED messages from a phone number, and we require a shared secret.
   const expectedSecret = env.SENDBLUE_WEBHOOK_SECRET?.trim();
@@ -1064,6 +1090,12 @@ async function handleSendblueWebhook(request: Request, env: Env) {
 
   if (isOutbound || status?.toUpperCase() !== "RECEIVED" || (!content && !mediaUrl) || !fromNumber) {
     return json({ ok: true, ignored: true });
+  }
+  const readReceipt = sendReadReceipt(env, fromNumber);
+  if (ctx) {
+    ctx.waitUntil(readReceipt);
+  } else {
+    await readReceipt;
   }
   if (externalId && await findExternalReply(env, externalId)) {
     return json({ ok: true, duplicate: true });
@@ -1216,7 +1248,7 @@ async function handleThreadEvents(request: Request, env: Env, threadId: string) 
   return env.REMOTE_THREAD_SOCKET.get(id).fetch(request);
 }
 
-export async function handleRequest(request: Request, env: Env) {
+export async function handleRequest(request: Request, env: Env, ctx?: ExecutionContext) {
   // Thin router. Keeping routes explicit makes the public surface easy to audit.
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: JSON_HEADERS });
@@ -1231,7 +1263,7 @@ export async function handleRequest(request: Request, env: Env) {
     }
 
     if (request.method === "POST" && url.pathname === "/webhooks/sendblue") {
-      return await handleSendblueWebhook(request, env);
+      return await handleSendblueWebhook(request, env, ctx);
     }
 
     if (request.method === "POST" && url.pathname === "/installations") {
@@ -1276,5 +1308,7 @@ export async function handleRequest(request: Request, env: Env) {
 }
 
 export default {
-  fetch: handleRequest,
+  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    return handleRequest(request, env, ctx);
+  },
 };

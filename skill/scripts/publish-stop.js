@@ -4,7 +4,7 @@ const http = require("http");
 const https = require("https");
 const os = require("os");
 const path = require("path");
-const { apiFetch, readActiveThreads, readConfig, stateDir, writeActiveThreads } = require("./common.js");
+const { apiFetch, readActiveThreads, readConfig, shellQuote, stateDir, writeActiveThreads } = require("./common.js");
 
 const LOCAL_ONLY_START = "**Remote message**";
 const WS_CONNECTING = 0;
@@ -527,7 +527,7 @@ function attachmentLines(paths) {
   ];
 }
 
-function continuationForReply(reply) {
+function continuationForReply(codexThreadId, reply) {
   // This text becomes the next local Codex user message. The visible block gives
   // the local thread context, while the "User message to answer" section is the
   // actual remote prompt Codex should respond to.
@@ -544,10 +544,19 @@ function continuationForReply(reply) {
   if (reply.attachmentError) {
     userMessageParts.push("Attached images could not be downloaded: " + reply.attachmentError);
   }
+  const updateCommand = [
+    "node",
+    shellQuote(path.join(__dirname, "send-update.js")),
+    "--thread-id=" + shellQuote(codexThreadId),
+    "--message=" + shellQuote("Brief progress update here"),
+  ].join(" ");
 
   return [
     "Treat the following remote message exactly as if the user typed it directly in this chat.",
     "Answer normally and focus on the user's request; delivery details are not relevant unless the user asks about them.",
+    "If the work may take more than a few minutes, send the iMessage user a very brief progress update every few minutes by running this command with a one- or two-sentence update:",
+    updateCommand,
+    "Use progress updates sparingly; they are only to reassure the user during longer tasks.",
     "Start your assistant response with the local display block below exactly as shown, then a blank line, then the substantive answer, code changes, or work summary you would normally give the user.",
     "The blockquote is visible in the local Codex thread; the Stop hook removes this leading display block before sending the answer back over iMessage.",
     "Do not otherwise repeat or paraphrase the remote message.",
@@ -660,7 +669,7 @@ try {
     const preparedReply = await prepareReplyForContinuation(codexThreadId, reply);
     console.log(JSON.stringify({
       decision: "block",
-      reason: continuationForReply(preparedReply),
+      reason: continuationForReply(codexThreadId, preparedReply),
     }));
   }
 } catch {

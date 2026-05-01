@@ -91,7 +91,7 @@ Then redeploy with `pnpm exec wrangler deploy` and update the Sendblue webhook U
 
 - `POST /installations`: returns a local install token.
 - `POST /threads/:threadId`: registers or re-enables a Codex thread.
-- `POST /threads/:threadId/status`: forwards Codex output and generated images to iMessage without storing the outbound content.
+- `POST /threads/:threadId/status`: forwards Codex output, progress updates, and generated images to iMessage without storing the outbound content.
 - `GET /threads/:threadId/events`: WebSocket delivery events backed by the relay Durable Object.
 - `POST /threads/:threadId/replies/:replyId/claim`: claims one reply or media group.
 - `GET /threads/:threadId`: debug thread state.

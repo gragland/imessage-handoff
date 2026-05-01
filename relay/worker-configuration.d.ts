@@ -8,7 +8,7 @@ declare namespace Cloudflare {
 	}
 	interface Env {
 		DB: D1Database;
-		SENDBLUE_FROM_NUMBER: "+16452468235";
+		SENDBLUE_FROM_NUMBER: "+12344198201";
 		SENDBLUE_API_BASE_URL: "https://api.sendblue.com/api";
 		SENDBLUE_TYPING_DELAY_MS: "2000";
 		REMOTE_THREAD_SOCKET: DurableObjectNamespace<import("./src/worker").RemoteThreadSocket>;

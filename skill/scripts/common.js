@@ -41,8 +41,9 @@ function writeText(filePath, value) {
 }
 
 function readConfig() {
-  // Prefer installer-written config. Env vars are a convenience for tests and
-  // local smoke runs where writing config first would be annoying.
+  // Prefer explicit config created after the user chooses hosted or self-hosted.
+  // Env vars are only a local-development escape hatch when both URL and token
+  // are supplied; we never choose a relay silently.
   ensureStateDirs();
   if (existsSync(configPath)) {
     const config = readJson(configPath);
@@ -74,16 +75,14 @@ function readConfig() {
 }
 
 async function ensureLocalInstall() {
-  // This lets skills installed by a generic skill manager finish setup the first
-  // time "start remote" runs. The npm installer still does the same work up
-  // front, but start-remote can now repair missing config/hooks too.
+  // This repairs hook/config details for an already configured install. First
+  // use must go through the skill's relay choice and hook consent prompts before
+  // this script runs.
   const existingConfig = existsSync(configPath) ? readJson(configPath) : null;
-  const apiBaseUrl = String(
-    process.env.REMOTE_CONTROL_API_BASE_URL
-    || process.env.REMOTE_CONTROL_RELAY_URL
-    || existingConfig?.apiBaseUrl
-    || defaultRelayUrl
-  ).replace(/\/+$/, "");
+  if (!existingConfig && !(process.env.REMOTE_CONTROL_API_BASE_URL && process.env.REMOTE_CONTROL_TOKEN)) {
+    throw new Error("Remote Control is not configured yet. Choose the hosted relay or provide your self-hosted relay URL before starting remote.");
+  }
+  const apiBaseUrl = String(process.env.REMOTE_CONTROL_API_BASE_URL || existingConfig?.apiBaseUrl || "").replace(/\/+$/, "");
   const token = existingConfig && typeof existingConfig.token === "string" && existingConfig.token.trim()
     ? existingConfig.token.trim()
     : process.env.REMOTE_CONTROL_TOKEN

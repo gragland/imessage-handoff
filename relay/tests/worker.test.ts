@@ -13,6 +13,12 @@ async function ownerIdForToken(token: string) {
 const DEV_OWNER_ID = await ownerIdForToken("dev-token");
 const relayBuffers = new WeakMap<Env, RemoteThreadSocket>();
 
+function outboundContents(calls: Array<Record<string, unknown> | null>) {
+  return calls
+    .filter((call) => call && typeof call.content === "string")
+    .map((call) => call?.content);
+}
+
 class FakeStatement {
   #db: FakeD1Database;
   #sql: string;
@@ -221,7 +227,7 @@ function env() {
     SENDBLUE_API_KEY: "sendblue-key",
     SENDBLUE_SECRET_KEY: "sendblue-secret",
     SENDBLUE_WEBHOOK_SECRET: "webhook-secret",
-    SENDBLUE_FROM_NUMBER: "+16452468235",
+    SENDBLUE_FROM_NUMBER: "+12344198201",
     SENDBLUE_API_BASE_URL: "https://api.sendblue.test/api",
     SENDBLUE_TYPING_DELAY_MS: "0",
   } satisfies Env;
@@ -544,12 +550,16 @@ test("pairs a phone by code without enqueueing a pending reply", async () => {
     assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, threadId);
     assert.equal(db.threads.get(threadId)?.pairing_code, null);
     assert.deepEqual(calls.map((call) => call.url), [
+      "https://api.sendblue.test/api/mark-read",
       "https://api.sendblue.test/api/evaluate-service?number=%2B15551234567",
       "https://api.sendblue.test/api/send-message",
     ]);
-    assert.deepEqual(calls.map((call) => call.body), [null, {
+    assert.deepEqual(calls.map((call) => call.body), [{
       number: "+15551234567",
-      from_number: "+16452468235",
+      from_number: "+12344198201",
+    }, null, {
+      number: "+15551234567",
+      from_number: "+12344198201",
       content: 'You’re connected to "Remote test" on Codex.\n\nYou were deciding what the first playable prototype should include.\n\nWhat do you want to do next?',
     }]);
 
@@ -581,7 +591,7 @@ test("activation message omits the summary paragraph when no summary exists", as
   } finally {
     globalThis.fetch = originalFetch;
   }
-  assert.deepEqual(calls.map((call) => call?.content), [
+  assert.deepEqual(outboundContents(calls), [
     'You’re connected to "Remote test" on Codex.\n\nWhat do you want to do next?',
   ]);
 });
@@ -608,7 +618,7 @@ test("activation message uses generic copy when no title exists", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
-  assert.deepEqual(calls.map((call) => call?.content), [
+  assert.deepEqual(outboundContents(calls), [
     "You’re connected to this Codex thread.\n\nWhat do you want to do next?",
   ]);
 });
@@ -641,12 +651,16 @@ test("pairing rejects phone numbers that do not support iMessage", async () => {
     assert.equal(db.phoneBindings.get("+15551234567"), undefined);
     assert.equal(db.threads.get(threadId)?.pairing_code, pairingCode);
     assert.deepEqual(calls.map((call) => call.url), [
+      "https://api.sendblue.test/api/mark-read",
       "https://api.sendblue.test/api/evaluate-service?number=%2B15551234567",
       "https://api.sendblue.test/api/send-message",
     ]);
-    assert.deepEqual(calls.map((call) => call.body), [null, {
+    assert.deepEqual(calls.map((call) => call.body), [{
       number: "+15551234567",
-      from_number: "+16452468235",
+      from_number: "+12344198201",
+    }, null, {
+      number: "+15551234567",
+      from_number: "+12344198201",
       content: "Remote Control only supports phone numbers that use iMessage for now.",
     }]);
     assert.deepEqual(pendingReplies(testEnv, threadId), []);
@@ -827,7 +841,7 @@ test("starting another thread for a paired user makes it active", async () => {
   assert.equal(secondBody.paired, true);
   assert.equal(secondBody.pairingCode, null);
   assert.equal(secondBody.skipNextStatusSend, true);
-  assert.deepEqual(calls.map((call) => call.content), ['You’re connected to "Second" on Codex.\n\nYou were choosing the next remote task.\n\nWhat do you want to do next?']);
+  assert.deepEqual(outboundContents(calls), ['You’re connected to "Second" on Codex.\n\nYou were choosing the next remote task.\n\nWhat do you want to do next?']);
   assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, secondThreadId);
   assert.equal(db.threads.get(secondThreadId)?.pairing_code, null);
 
@@ -861,7 +875,7 @@ test("list command returns numbered enabled threads without status labels", asyn
 
     const response = await handleRequest(sendblueWebhook(inboundMessage("list", "list_msg_1")), testEnv);
     assert.equal(response.status, 200);
-    assert.deepEqual(calls.map((call) => call.content), [
+    assert.deepEqual(outboundContents(calls), [
       "Remote threads:\n\n1. Second (current)\n2. Remote test\n\nReply with a number to switch.",
     ]);
     assert.doesNotMatch(String(calls[0]?.content), /enabled|stopped/i);
@@ -889,7 +903,7 @@ test("list command reports when the paired phone has no remote threads", async (
   try {
     const response = await handleRequest(sendblueWebhook(inboundMessage("list", "list_msg_empty")), testEnv);
     assert.equal(response.status, 200);
-    assert.deepEqual(calls.map((call) => call.content), ["You have no remote codex threads"]);
+    assert.deepEqual(outboundContents(calls), ["You have no remote codex threads"]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -912,7 +926,7 @@ test("normal text reports when there is no active thread to forward to", async (
   try {
     const response = await handleRequest(sendblueWebhook(inboundMessage("What is 2 + 2?", "msg_no_thread")), testEnv);
     assert.equal(response.status, 200);
-    assert.deepEqual(calls.map((call) => call.content), ["You have no remote codex threads"]);
+    assert.deepEqual(outboundContents(calls), ["You have no remote codex threads"]);
     const pending = pendingReplies(testEnv);
     assert.deepEqual(pending, []);
   } finally {
@@ -946,7 +960,7 @@ test("number command switches the active thread using the current list order", a
     const response = await handleRequest(sendblueWebhook(inboundMessage("2", "switch_msg_1")), testEnv);
     assert.equal(response.status, 200);
     assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, firstThreadId);
-    assert.deepEqual(calls.map((call) => call.content), ['Switched to "Remote test".']);
+    assert.deepEqual(outboundContents(calls), ['Switched to "Remote test".']);
 
     await handleRequest(sendblueWebhook(inboundMessage("Now use the first thread", "msg_2")), testEnv);
     assert.equal(pendingReplies(testEnv, firstThreadId).length, 1);
@@ -973,7 +987,7 @@ test("out-of-range number command does not change the active thread or enqueue a
     const response = await handleRequest(sendblueWebhook(inboundMessage("2", "switch_msg_bad")), testEnv);
     assert.equal(response.status, 200);
     assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, threadId);
-    assert.deepEqual(calls.map((call) => call.content), ["Text threads to see active remote threads."]);
+    assert.deepEqual(outboundContents(calls), ["Text threads to see active remote threads."]);
     assert.deepEqual(pendingReplies(testEnv, threadId), []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1014,7 +1028,7 @@ test("stopping a thread disables it and switches to the newest remaining thread"
     assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, firstThreadId);
 
     await handleRequest(sendblueWebhook(inboundMessage("list", "list_after_stop")), testEnv);
-    assert.deepEqual(calls.map((call) => call.content), [
+    assert.deepEqual(outboundContents(calls), [
       "Remote threads:\n\n1. Remote test (current)\n\nReply with a number to switch.",
     ]);
   } finally {
@@ -1131,7 +1145,7 @@ test("claims a pending reply exactly once", async () => {
       url: "https://api.sendblue.test/api/send-typing-indicator",
       body: {
         number: "+15551234567",
-        from_number: "+16452468235",
+        from_number: "+12344198201",
       },
     }]);
 
@@ -1218,7 +1232,7 @@ test("publishes every non-empty status to sendblue", async () => {
     assert.equal(calls[0]?.headers.get("sb-api-secret-key"), "sendblue-secret");
     assert.deepEqual(calls[0]?.body, {
       number: "+15551234567",
-      from_number: "+16452468235",
+      from_number: "+12344198201",
       content: "Created TEMP.",
     });
     assert.equal((await notification(duplicate)).messageHandle, "message-2");
@@ -1260,7 +1274,7 @@ test("publishes each changed assistant message", async () => {
       assert.equal(response.status, 200);
     }
 
-    assert.deepEqual(calls.map((call) => call.content), ["81", "Created TEMP."]);
+    assert.deepEqual(outboundContents(calls), ["81", "Created TEMP."]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1310,7 +1324,7 @@ test("uploads one generated image and sends it with send-message", async () => {
         url: "https://api.sendblue.test/api/send-message",
         body: {
           number: "+15551234567",
-          from_number: "+16452468235",
+          from_number: "+12344198201",
           media_url: "https://cdn.sendblue.test/cow.png",
         },
       },
@@ -1363,7 +1377,7 @@ test("sends text and one generated image together", async () => {
       url: "https://api.sendblue.test/api/send-message",
       body: {
         number: "+15551234567",
-        from_number: "+16452468235",
+        from_number: "+12344198201",
         content: "Here is a cow.",
         media_url: "https://cdn.sendblue.test/cow.png",
       },
@@ -1418,7 +1432,7 @@ test("uploads multiple generated images and sends one carousel", async () => {
     ]);
     assert.deepEqual(calls[2]?.body, {
       number: "+15551234567",
-      from_number: "+16452468235",
+      from_number: "+12344198201",
       media_urls: [
         "https://cdn.sendblue.test/image-1.png",
         "https://cdn.sendblue.test/image-2.png",
@@ -1477,7 +1491,7 @@ test("sends text before carousel for text plus multiple images", async () => {
     ]);
     assert.deepEqual(calls[2]?.body, {
       number: "+15551234567",
-      from_number: "+16452468235",
+      from_number: "+12344198201",
       content: "Two cow options.",
     });
     assert.equal((await notification(status)).messageHandle, "carousel-1");

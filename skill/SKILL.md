@@ -13,13 +13,55 @@ If this skill is invoked without additional instructions, start remote for the c
 
 When starting remote, run the starter script yourself. Do not tell the user to run it.
 
+Before running `scripts/start-remote.js`, check whether Remote Control has local relay config:
+
+1. Run `node scripts/configure.js show`, resolving `scripts/configure.js` relative to this `SKILL.md`.
+2. If `configured` is false, do not run `scripts/start-remote.js`. Ask exactly:
+
+   ```text
+   Remote Control needs an iMessage relay before it can start.
+
+   1. Use the hosted relay
+      Your messages pass through our server so we can forward them to iMessage. We avoid storing message content in our database.
+
+   2. Deploy your own relay
+      Follow the instructions here: https://github.com/gragland/remote-control
+
+   Reply with 1 or 2. You can switch relays any time by asking Remote Control to switch.
+   ```
+
+3. If the user replies with `1`, "hosted", "use yours", "use hosted", or similar, run `node scripts/configure.js use-default-relay`, then ask the hook consent question below.
+4. If the user replies with `2`, "deploy my own", "self-hosted", or similar without a relay URL, reply exactly:
+
+   ```text
+   Okay. Follow the instructions here: https://github.com/gragland/remote-control
+
+   When you’re done, paste in your relay URL. Or just let me know if you’d like to use the hosted relay for now.
+   ```
+
+5. If the user provides a relay URL, run `node scripts/configure.js set-relay --url="URL"`, then ask the hook consent question below.
+
+After relay config exists, but before the first time you run `scripts/start-remote.js` in this setup flow, ask exactly:
+
+```text
+Remote Control also needs to install a Codex Stop hook. After Codex responds, this hook forwards the response to the relay and waits for iMessage replies.
+
+With your permission, I’ll install it now. After installation, restart Codex once. If you ever want to remove the hook, tell Remote Control to uninstall itself.
+
+Reply yes to install the hook.
+```
+
+Only continue starting remote after the user says yes or gives an equivalent confirmation. If they do not confirm, do not run `scripts/start-remote.js`.
+
+Once relay config exists and hook consent is confirmed:
+
 1. Write a one-sentence handoff summary for iMessage before running the script.
    - Summarize only what this thread was about immediately before starting remote control.
    - Prefer natural recap wording like `We last discussed ...` when it fits.
    - Summarize the work itself, not the setup or delivery mechanism.
    - Keep it plain text and very short, ideally under 140 characters.
    - If there is not enough useful context, use no summary.
-2. Run the bundled `scripts/start-remote.js` from this skill's installed directory with `--handoff-summary="SUMMARY"` when you have a useful summary, or with no arguments when you do not. The first run creates local config and installs the Codex Stop hook if needed.
+2. Run the bundled `scripts/start-remote.js` from this skill's installed directory with `--handoff-summary="SUMMARY"` when you have a useful summary, or with no arguments when you do not. This registers the thread and installs or repairs the Codex Stop hook after consent.
 3. Use Node to run the script, for example `node scripts/start-remote.js` after resolving `scripts/start-remote.js` relative to this `SKILL.md`.
 4. If that fails with a sandbox or network error such as `fetch failed`, retry with approval using the same command. Do not request escalation before trying the normal command first.
 5. Read the JSON output.
@@ -77,7 +119,7 @@ Required shape:
 }
 ```
 
-If config is missing, `start-remote.js` creates it automatically on first use.
+If config is missing, ask the relay-choice question from Start Remote. Do not run `start-remote.js` until the user chooses hosted or provides a self-hosted relay URL.
 
 For self-hosting, set the relay before starting remote by asking Remote Control to use the self-hosted relay URL.
 

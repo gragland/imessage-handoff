@@ -21,13 +21,15 @@ The installer-style flow is still supported:
 npx github:gragland/remote-control install
 ```
 
-The first `start remote` run completes setup automatically by creating a config and installing the Codex Stop hook. Add `--global` if you want the skill available outside the current project.
+Add `--global` if you want the skill available outside the current project.
 
 After installing, open a Codex thread and say:
 
 ```text
 start remote
 ```
+
+On first use, Codex asks whether you want the hosted iMessage relay or your own relay, then asks permission to install the Codex Stop hook used to forward responses and wait for iMessage replies. Restart Codex once after the hook is installed.
 
 If this is your first time, Codex prints a pairing code. Text that code to the phone number shown by Codex. After that, text normal instructions from iMessage.
 
@@ -49,12 +51,14 @@ Ask `Remote Control uninstall yourself`. This removes the Codex Stop hook used f
 
 ## How It Works
 
-1. The installer asks the relay for a token and stores it locally in the installed skill directory.
-2. `start remote` registers the current `CODEX_THREAD_ID` with the relay.
-3. When you text the pairing code, the relay links that local token to your phone number.
-4. The local Stop hook waits on a WebSocket connection to the relay.
-5. When an iMessage arrives from your paired phone, the relay wakes the waiting hook, the hook claims the message, and Codex continues the original thread.
-6. Codex results are forwarded to iMessage through Sendblue.
+1. You choose the hosted relay or configure your own relay.
+2. Remote Control asks permission to install the Codex Stop hook.
+3. `start remote` registers the current `CODEX_THREAD_ID` with the relay.
+4. When you text the pairing code, the relay links that local token to your phone number.
+5. The local Stop hook waits on a WebSocket connection to the relay.
+6. When an iMessage arrives from your paired phone, the relay wakes the waiting hook, the hook claims the message, and Codex continues the original thread.
+7. For longer remote tasks, Codex is prompted to send occasional short progress updates through the relay.
+8. Codex results are forwarded to iMessage through Sendblue.
 
 The local Stop hook maintains a WebSocket connection with the relay while it waits for remote input.
 
