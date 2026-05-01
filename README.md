@@ -18,7 +18,7 @@ $skill-installer install https://github.com/gragland/remote-control/tree/main/re
 After installing, open a Codex thread and say:
 
 ```text
-start remote
+$remote-control
 ```
 
 On first use, Codex asks whether you want the hosted iMessage relay or your own relay, then asks permission to install the Codex Stop hook used to forward responses and wait for iMessage replies. Restart Codex once after the hook is installed.
@@ -27,25 +27,25 @@ If this is your first time, Codex prints a pairing code. Text that code to the p
 
 ## Configure
 
-Configure Remote Control by asking the skill in Codex:
+Configure it by invoking the skill in Codex:
 
 ```text
-Remote Control show my config
-Remote Control use my self-hosted relay at https://<your-worker-url>
-Remote Control switch back to the hosted relay
-Remote Control reset my install token
-Remote Control uninstall yourself
+$remote-control show my config
+$remote-control use my self-hosted relay at https://<your-worker-url>
+$remote-control switch back to the hosted relay
+$remote-control reset my install token
+$remote-control uninstall yourself
 ```
 
 ## Uninstall
 
-Ask `Remote Control uninstall yourself`. This removes the Codex Stop hook used for communication with the relay. You can then disable or remove the skill in Codex settings.
+Ask `$remote-control uninstall yourself`. This removes the Codex Stop hook used for communication with the relay. You can then disable or remove the skill in Codex settings.
 
 ## How It Works
 
 1. You choose the hosted relay or configure your own relay.
-2. Remote Control asks permission to install the Codex Stop hook.
-3. `start remote` registers the current `CODEX_THREAD_ID` with the relay.
+2. The skill asks permission to install the Codex Stop hook.
+3. `$remote-control` registers the current `CODEX_THREAD_ID` with the relay.
 4. When you text the pairing code, the relay links that local token to your phone number.
 5. The local Stop hook waits on a WebSocket connection to the relay.
 6. When an iMessage arrives from your paired phone, the relay wakes the waiting hook, the hook claims the message, and Codex continues the original thread.
@@ -59,8 +59,8 @@ The local Stop hook maintains a WebSocket connection with the relay while it wai
 Local Codex:
 
 ```text
-start remote
-stop remote
+$remote-control
+$remote-control stop
 ```
 
 iMessage:
@@ -82,7 +82,7 @@ Remote Control is a relay for prompts into a local Codex thread. The local confi
 Keep `~/.codex/skills/remote-control/.state/config.json` private. If that token leaks, reset the install token and pair your phone again:
 
 ```text
-Remote Control reset my install token
+$remote-control reset my install token
 ```
 
 Remote Control is designed to store the minimum data needed to route messages. The relay avoids persisting conversation content, avoids logging message details, and stores only routing metadata such as thread state, pairing state, and phone bindings.
