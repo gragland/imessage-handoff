@@ -98,9 +98,10 @@ async function main() {
   if (command === "uninstall") {
     const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
     const hooksPath = path.join(codexHome, "hooks.json");
+    const hooksRemoved = uninstallStopHook(hooksPath);
     console.log(JSON.stringify({
       ok: true,
-      hooksRemoved: uninstallStopHook(hooksPath),
+      hooksRemoved,
       hooksPath,
     }, null, 2));
     return;

@@ -34,12 +34,12 @@ $remote-control show my config
 $remote-control use my self-hosted relay at https://<your-worker-url>
 $remote-control switch back to the hosted relay
 $remote-control reset my install token
-$remote-control uninstall yourself
+$remote-control remove hook
 ```
 
 ## Uninstall
 
-Ask `$remote-control uninstall yourself`. This removes the Codex Stop hook used for communication with the relay. You can then disable or remove the skill in Codex settings.
+Ask `$remote-control remove hook`. This removes the Codex Stop hook used for communication with the relay. You can then disable or remove the skill in Codex settings.
 
 ## How It Works
 

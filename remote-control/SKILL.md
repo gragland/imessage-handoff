@@ -46,7 +46,7 @@ After relay config exists, but before the first time you run `scripts/start-remo
 ```text
 Remote Control also needs to install a Codex Stop hook. After Codex responds, this hook forwards the response to the relay and waits for iMessage replies.
 
-With your permission, I’ll install it now. After installation, restart Codex once. If you ever want to remove the hook, tell Remote Control to uninstall itself.
+With your permission, I’ll install it now. After installation, restart Codex once. If you ever want to stop Remote Control from communicating with the relay, tell it to remove its hook.
 
 Reply yes to install the hook.
 ```
@@ -92,7 +92,7 @@ Use `scripts/configure.js` for configuration requests. Resolve the script path r
 - If the user asks to use a self-hosted relay or set/change the relay URL, run `node scripts/configure.js set-relay --url="https://..."`. Tell the user the relay was updated and that they can now start remote.
 - If the user asks to switch back to the hosted relay, run `node scripts/configure.js use-default-relay`.
 - If the user asks to reset the install token, run `node scripts/configure.js reset-token`. Tell the user the token was reset and that they may need to pair iMessage again.
-- If the user asks to uninstall Remote Control, run `node scripts/configure.js uninstall`. Tell the user the Codex Stop hook was removed and they can disable or remove the skill in Codex settings.
+- If the user asks to remove the hook, remove the Codex hook, or uninstall Remote Control, run `node scripts/configure.js uninstall`. Tell the user the Codex Stop hook was removed and they can disable or remove the skill in Codex settings.
 
 ## Stop Hook Behavior
 
