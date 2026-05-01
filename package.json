@@ -8,7 +8,7 @@
   },
   "files": [
     "bin/",
-    "skill/"
+    "remote-control/"
   ],
   "packageManager": "pnpm@10.26.0",
   "scripts": {

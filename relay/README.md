@@ -60,7 +60,7 @@ Before starting, you need a Cloudflare account, a Sendblue account with an iMess
 10. Install and configure the skill against your relay.
 
    ```bash
-   npx skills add https://github.com/gragland/remote-control --skill remote-control
+   $skill-installer install https://github.com/gragland/remote-control/tree/main/remote-control
    ```
 
    Then ask Codex: `Remote Control use my self-hosted relay at https://<your-worker-url>`

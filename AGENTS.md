@@ -4,7 +4,7 @@ This is the standalone Remote Control repo, intended to become public before lau
 
 ## Repo Shape
 
-- `skill`: installable Codex skill.
+- `remote-control`: installable Codex skill.
 - `relay`: plain Cloudflare Worker relay deployed with Wrangler.
 - This repo is now the source of truth. Do not continue feature work in the old monorepo `apps/codex-message` directory unless explicitly asked.
 
@@ -18,7 +18,7 @@ This is the standalone Remote Control repo, intended to become public before lau
 
 ## Gotchas
 
-- The README install path is `npx skills add https://github.com/gragland/remote-control --skill remote-control`. The root package also keeps the installer-style `npx github:gragland/remote-control install` flow for compatibility. Runtime setup and config changes should happen through natural-language skill commands where possible.
+- The README install path uses `$skill-installer install https://github.com/gragland/remote-control/tree/main/remote-control`. The root package also keeps the installer-style `npx github:gragland/remote-control install` flow for compatibility. Runtime setup and config changes should happen through natural-language skill commands where possible.
 - The installer default relay is still a temporary hosted workers.dev URL until a final product domain is chosen.
 - Sendblue API calls should use `api.sendblue.com`, not the older `.co` host.
 - Keep this repo free of private monorepo dependencies such as `@vibe/ui`.

@@ -2,26 +2,18 @@
 
 Remote Control lets you continue a local Codex thread from iMessage. It has two parts:
 
-- `skill`: the installable Codex skill and Stop hook scripts.
+- `remote-control`: the installable Codex skill and Stop hook scripts.
 - `relay`: a Cloudflare relay that connects Codex with iMessage via [Sendblue](https://www.sendblue.com/).
 
 The hosted relay is the default path. You can also deploy your own Cloudflare relay and point the skill at it.
 
 ## Install
 
-Install the skill with the Skills CLI:
+Install the skill from Codex:
 
-```bash
-npx skills add https://github.com/gragland/remote-control --skill remote-control
+```text
+$skill-installer install https://github.com/gragland/remote-control/tree/main/remote-control
 ```
-
-The installer-style flow is still supported:
-
-```bash
-npx github:gragland/remote-control install
-```
-
-Add `--global` if you want the skill available outside the current project.
 
 After installing, open a Codex thread and say:
 

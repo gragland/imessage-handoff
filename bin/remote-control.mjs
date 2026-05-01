@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const skillSourceDir = path.join(packageDir, "skill");
+const skillSourceDir = path.join(packageDir, "remote-control");
 
 function readArg(name) {
   const prefix = `--${name}=`;
