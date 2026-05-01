@@ -98,7 +98,9 @@ Then redeploy with `pnpm exec wrangler deploy` and update the Sendblue webhook U
 - `POST /threads/:threadId/stop`: disables iMessage handoff for a thread.
 - `POST /webhooks/sendblue`: receives Sendblue inbound events.
 
-All non-webhook thread APIs use `Authorization: Bearer <token>`. When a user pairs by texting the code, the relay links that token to their phone number.
+All non-webhook thread APIs use `Authorization: Bearer <token>`. When a user pairs by texting the code within 15 minutes, the relay links that token to their phone number. Failed code-shaped pairing attempts from the same phone number are rate-limited.
+
+The hosted relay also applies lightweight abuse caps: anonymous install-token creation and authenticated thread routes are rate-limited in memory by the relay Durable Object, each owner can have up to 25 enabled handoff threads, generated images are limited to 5 per status request, and each generated image must be 10 MB or smaller after base64 decoding.
 
 The relay stores the minimum data needed to route messages. Cloudflare D1 is still required for routing metadata such as thread state, pairing state, and phone bindings, but message content is never stored there. Inbound message content is held only in the Durable Object's in-memory buffer while pending, then scrubbed when local Codex claims it. Outbound Codex replies are forwarded to Sendblue and are not stored by the relay.
 

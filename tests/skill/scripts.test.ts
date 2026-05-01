@@ -61,6 +61,19 @@ function wait(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitForMockCall(mockPath: string, expected: string, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const mock = JSON.parse(readFileSync(mockPath, "utf8"));
+    const calls = Array.isArray(mock.calls) ? mock.calls : [];
+    if (calls.some((call: { method: string; path: string }) => `${call.method} ${call.path}` === expected)) {
+      return;
+    }
+    await wait(25);
+  }
+  throw new Error(`Timed out waiting for mock call: ${expected}`);
+}
+
 function tempState() {
   // Each test gets its own iMessage Handoff state directory. That keeps the
   // install/start/stop files isolated and makes failures easier to reason about.
@@ -413,7 +426,7 @@ test("start-handoff creates thread and writes active registry", async () => {
   assert.equal(parsed.paired, false);
   assert.equal(parsed.pairingRequired, true);
   assert.equal(parsed.pairingCode, "ABC123");
-  assert.equal(parsed.localMessage, "iMessage Handoff is enabled. Text `ABC123` to `+1 (234) 419-8201` to continue this thread from iMessage.");
+  assert.equal(parsed.localMessage, "iMessage Handoff is enabled. Text `ABC123` to `+1 (234) 419-8201` within 15 minutes to continue this thread from iMessage.");
   assert.match(parsed.statusCurlCommand, /curl -sS/);
   assert.match(parsed.statusCurlCommand, /\/threads\/codex-thread-1/);
   const active = JSON.parse(readFileSync(path.join(stateDir, "active-threads.json"), "utf8"));
@@ -474,7 +487,7 @@ test("start-handoff omits restart hint when hook setup is unchanged", async () =
   });
   assert.equal(result.code, 0);
   const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.localMessage, "iMessage Handoff is enabled. Text `ABC123` to `+1 (234) 419-8201` to continue this thread from iMessage.");
+  assert.equal(parsed.localMessage, "iMessage Handoff is enabled. Text `ABC123` to `+1 (234) 419-8201` within 15 minutes to continue this thread from iMessage.");
 });
 
 test("start-handoff uses the Codex sidebar title from the local state db", async () => {
@@ -789,7 +802,7 @@ test("publish-stop disables handoff and blocks with a local takeover note", asyn
     last_assistant_message: "Done.",
   }));
 
-  await wait(100);
+  await waitForMockCall(mockPath, "POST /threads/codex-thread-1/status");
   writeFileSync(globalState, JSON.stringify({
     "queued-follow-ups": {
       "codex-thread-1": [{ id: "follow-up-1", text: "local message" }],

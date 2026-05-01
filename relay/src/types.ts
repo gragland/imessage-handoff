@@ -25,6 +25,7 @@ export interface HandoffThreadRow {
   status: string;
   handoff_enabled: number;
   pairing_code: string | null;
+  pairing_code_expires_at: string | null;
   last_stop_at: string | null;
   created_at: string;
   updated_at: string;
@@ -53,5 +54,14 @@ export interface PhoneBindingRow {
   active_thread_id: string | null;
   contact_card_sent_at: string | null;
   created_at: string;
+  updated_at: string;
+}
+
+export interface PairingAttemptLimitRow {
+  // Failed code-shaped pairing attempts from one phone number.
+  phone_number: string;
+  failed_count: number;
+  window_start_at: string;
+  blocked_until: string | null;
   updated_at: string;
 }

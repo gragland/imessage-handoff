@@ -23,7 +23,7 @@ $imessage-handoff
 
 On first use, Codex asks whether you want the hosted iMessage relay or your own relay, then asks permission to install the Codex Stop hook used to forward responses and wait for iMessage replies. Restart Codex once after the hook is installed.
 
-If this is your first time, Codex prints a pairing code. Text that code to the phone number shown by Codex. After that, text normal instructions from iMessage.
+If this is your first time, Codex prints a pairing code. Text that code to the phone number shown by Codex within 15 minutes. After that, text normal instructions from iMessage.
 
 ## How It Works
 

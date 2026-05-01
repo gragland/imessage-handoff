@@ -85,7 +85,7 @@ async function main() {
   const localMessage = registrationResult.pairingRequired
     // First install: user must text this code once so the relay can bind phone
     // number -> local install token owner.
-    ? `iMessage Handoff is enabled. Text \`${registrationResult.pairingCode}\` to \`${sendblueNumberDisplay}\` to continue this thread from iMessage.`
+    ? `iMessage Handoff is enabled. Text \`${registrationResult.pairingCode}\` to \`${sendblueNumberDisplay}\` within 15 minutes to continue this thread from iMessage.`
     // Already paired: starting iMessage Handoff switches the paired phone to this thread.
     : `iMessage Handoff is enabled. Text \`${sendblueNumberDisplay}\` to talk to Codex.`;
 

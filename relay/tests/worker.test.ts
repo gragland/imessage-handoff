@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { HandoffSocket, handleRequest } from "../src/worker.ts";
-import type { Env, PhoneBindingRow, HandoffReplyRow, HandoffThreadRow } from "../src/types.ts";
+import type { Env, PairingAttemptLimitRow, PhoneBindingRow, HandoffReplyRow, HandoffThreadRow } from "../src/types.ts";
 
 // The relay tests run the Worker directly in Node. These fakes keep the tests
 // fast while still exercising the same request handlers that Wrangler serves.
@@ -53,6 +53,7 @@ class FakeD1Database {
   // behavior added so tests continue to mirror the deployed relay.
   threads = new Map<string, HandoffThreadRow>();
   phoneBindings = new Map<string, PhoneBindingRow>();
+  pairingAttemptLimits = new Map<string, PairingAttemptLimitRow>();
 
   prepare(sql: string) {
     return new FakeStatement(this, sql);
@@ -60,7 +61,7 @@ class FakeD1Database {
 
   run(sql: string, values: unknown[]) {
     if (sql.includes("INSERT INTO handoff_threads")) {
-      const [id, ownerId, cwd, title, handoffSummary, pairingCode, createdAt, updatedAt] = values as string[];
+      const [id, ownerId, cwd, title, handoffSummary, pairingCode, pairingCodeExpiresAt, createdAt, updatedAt] = values as string[];
       const existing = this.threads.get(id);
       this.threads.set(id, {
         id,
@@ -71,6 +72,7 @@ class FakeD1Database {
         status: "enabled",
         handoff_enabled: 1,
         pairing_code: pairingCode,
+        pairing_code_expires_at: pairingCodeExpiresAt,
         last_stop_at: existing?.last_stop_at ?? null,
         created_at: existing?.created_at ?? createdAt,
         updated_at: updatedAt,
@@ -105,6 +107,7 @@ class FakeD1Database {
         for (const thread of this.threads.values()) {
           if (thread.owner_id === ownerId && thread.id !== excludedId) {
             thread.pairing_code = null;
+            thread.pairing_code_expires_at = null;
             thread.updated_at = updatedAt;
           }
         }
@@ -116,6 +119,7 @@ class FakeD1Database {
         return { meta: { changes: 0 } };
       }
       thread.pairing_code = null;
+      thread.pairing_code_expires_at = null;
       thread.updated_at = updatedAt;
       return { meta: { changes: 1 } };
     }
@@ -129,6 +133,7 @@ class FakeD1Database {
       thread.status = "stopped";
       thread.handoff_enabled = 0;
       thread.pairing_code = null;
+      thread.pairing_code_expires_at = null;
       thread.updated_at = updatedAt;
       return { meta: { changes: 1 } };
     }
@@ -154,6 +159,24 @@ class FakeD1Database {
       thread.last_stop_at = String(lastStopAt);
       thread.updated_at = String(updatedAt);
       return { meta: { changes: 1 } };
+    }
+
+    if (sql.includes("INSERT INTO pairing_attempt_limits")) {
+      const [phoneNumber, failedCount, windowStartAt, blockedUntil, updatedAt] = values as Array<string | number | null>;
+      const normalizedPhone = String(phoneNumber);
+      this.pairingAttemptLimits.set(normalizedPhone, {
+        phone_number: normalizedPhone,
+        failed_count: Number(failedCount),
+        window_start_at: String(windowStartAt),
+        blocked_until: blockedUntil ? String(blockedUntil) : null,
+        updated_at: String(updatedAt),
+      });
+      return { meta: { changes: 1 } };
+    }
+
+    if (sql.includes("DELETE FROM pairing_attempt_limits")) {
+      const deleted = this.pairingAttemptLimits.delete(String(values[0]));
+      return { meta: { changes: deleted ? 1 : 0 } };
     }
 
     if (sql.includes("DELETE FROM phone_bindings")) {
@@ -200,7 +223,17 @@ class FakeD1Database {
 
     if (sql.includes("SELECT * FROM handoff_threads WHERE pairing_code = ?")) {
       const pairingCode = String(values[0]);
-      return ([...this.threads.values()].find((thread) => thread.pairing_code === pairingCode && thread.handoff_enabled === 1) ?? null) as T | null;
+      const now = String(values[1] ?? "");
+      return ([...this.threads.values()].find((thread) =>
+        thread.pairing_code === pairingCode
+        && thread.handoff_enabled === 1
+        && Boolean(thread.pairing_code_expires_at)
+        && String(thread.pairing_code_expires_at) > now
+      ) ?? null) as T | null;
+    }
+
+    if (sql.includes("FROM pairing_attempt_limits WHERE phone_number = ?")) {
+      return (this.pairingAttemptLimits.get(String(values[0])) ?? null) as T | null;
     }
 
     if (sql.includes("SELECT * FROM handoff_threads")) {
@@ -343,6 +376,14 @@ function generatedImage(filename: string, data = "png-bytes") {
   };
 }
 
+function generatedImageBytes(filename: string, bytes: Uint8Array) {
+  return {
+    filename,
+    mimeType: "image/png",
+    dataBase64: Buffer.from(bytes).toString("base64"),
+  };
+}
+
 test("creates install tokens", async () => {
   const testEnv = env();
   const response = await handleRequest(req("/installations", { method: "POST" }), testEnv);
@@ -350,6 +391,23 @@ test("creates install tokens", async () => {
   const body = await json(response);
   assert.equal(typeof body.token, "string");
   assert.match(String(body.token), /^ih_[a-f0-9]{64}$/);
+});
+
+test("rate limits installation token creation by client IP", async () => {
+  const testEnv = env();
+  for (let index = 0; index < 30; index += 1) {
+    const response = await handleRequest(req("/installations", {
+      method: "POST",
+      headers: { "cf-connecting-ip": "203.0.113.10" },
+    }), testEnv);
+    assert.equal(response.status, 200);
+  }
+
+  const limited = await handleRequest(req("/installations", {
+    method: "POST",
+    headers: { "cf-connecting-ip": "203.0.113.10" },
+  }), testEnv);
+  assert.equal(limited.status, 429);
 });
 
 test("serves the Codex contact card and image", async () => {
@@ -397,11 +455,33 @@ test("creates and upserts a handoff thread with an explicit id", async () => {
   assert.equal(body.id, threadId);
   assert.equal(typeof body.pairingCode, "string");
   assert.equal(String(body.pairingCode).length, 6);
+  assert.equal(typeof body.pairingCodeExpiresAt, "string");
+  assert.equal(Date.parse(String(body.pairingCodeExpiresAt)) > Date.now(), true);
   assert.equal(body.cwd, "/tmp/project-renamed");
   assert.equal(body.title, "iMessage test updated");
   assert.equal(body.handoffSummary, "You were reviewing iMessage handoff copy.");
   assert.equal(body.status, "enabled");
   assert.equal(body.handoffEnabled, true);
+});
+
+test("limits enabled handoff threads per owner", async () => {
+  const testEnv = env();
+  for (let index = 1; index <= 25; index += 1) {
+    const response = await handleRequest(req(`/threads/thread-limit-${index}`, {
+      method: "POST",
+      headers: { authorization: "Bearer dev-token" },
+      body: JSON.stringify({ cwd: "/tmp/project", title: `Thread ${index}` }),
+    }), testEnv);
+    assert.equal(response.status, 200);
+  }
+
+  const limited = await handleRequest(req("/threads/thread-limit-26", {
+    method: "POST",
+    headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({ cwd: "/tmp/project", title: "Thread 26" }),
+  }), testEnv);
+  assert.equal(limited.status, 429);
+  assert.match(String((await json(limited)).error), /Too many active handoff threads/);
 });
 
 test("proxies authorized thread websocket upgrades to the Durable Object", async () => {
@@ -417,6 +497,9 @@ test("proxies authorized thread websocket upgrades to the Durable Object", async
         id,
         fetch: async (request: Request) => {
           calls.push({ name: (id as unknown as { name: string }).name, url: request.url });
+          if (new URL(request.url).pathname === "/rate-limit") {
+            return new Response(JSON.stringify({ ok: true, allowed: true }), { status: 200 });
+          }
           return new Response(JSON.stringify({ ok: true }), { status: 200 });
         },
       } as unknown as DurableObjectStub;
@@ -428,10 +511,20 @@ test("proxies authorized thread websocket upgrades to the Durable Object", async
   }), testEnv);
 
   assert.equal(response.status, 200);
-  assert.deepEqual(calls, [{
-    name: "global",
-    url: `https://imessage-handoff.test/threads/${threadId}/events?token=dev-token`,
-  }]);
+  assert.deepEqual(calls, [
+    {
+      name: "global",
+      url: "https://imessage-handoff.internal/rate-limit",
+    },
+    {
+      name: "global",
+      url: "https://imessage-handoff.internal/rate-limit",
+    },
+    {
+      name: "global",
+      url: `https://imessage-handoff.test/threads/${threadId}/events?token=dev-token`,
+    },
+  ]);
 });
 
 test("rejects unauthorized thread websocket upgrades", async () => {
@@ -581,6 +674,7 @@ test("pairs a phone by code without enqueueing a pending reply", async () => {
     assert.equal(body.service, "iMessage");
     assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, threadId);
     assert.equal(db.threads.get(threadId)?.pairing_code, null);
+    assert.equal(db.threads.get(threadId)?.pairing_code_expires_at, null);
     assert.deepEqual(calls.map((call) => call.url), [
       "https://api.sendblue.test/api/mark-read",
       "https://api.sendblue.test/api/evaluate-service?number=%2B15551234567",
@@ -733,6 +827,7 @@ test("pairing rejects phone numbers that do not support iMessage", async () => {
     assert.equal(body.unsupportedService, "SMS");
     assert.equal(db.phoneBindings.get("+15551234567"), undefined);
     assert.equal(db.threads.get(threadId)?.pairing_code, pairingCode);
+    assert.equal(typeof db.threads.get(threadId)?.pairing_code_expires_at, "string");
     assert.deepEqual(calls.map((call) => call.url), [
       "https://api.sendblue.test/api/mark-read",
       "https://api.sendblue.test/api/evaluate-service?number=%2B15551234567",
@@ -1134,10 +1229,25 @@ test("starting another thread for an unpaired user replaces the old pairing code
   }), testEnv);
   assert.equal(startSecond.status, 200);
   assert.equal(db.threads.get(firstThreadId)?.pairing_code, null);
+  assert.equal(db.threads.get(firstThreadId)?.pairing_code_expires_at, null);
 
-  const oldCodeResponse = await handleRequest(sendblueWebhook(inboundMessage(String(firstCode), "old_pair_msg")), testEnv);
-  assert.equal(oldCodeResponse.status, 200);
-  assert.equal((await json(oldCodeResponse)).ignored, true);
+  const originalFetch = globalThis.fetch;
+  const calls: Array<Record<string, unknown> | null> = [];
+  globalThis.fetch = async (_input, init) => {
+    calls.push(init?.body ? JSON.parse(String(init.body)) : null);
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: `message-${calls.length}` }), { status: 200 });
+  };
+  try {
+    const oldCodeResponse = await handleRequest(sendblueWebhook(inboundMessage(String(firstCode), "old_pair_msg")), testEnv);
+    assert.equal(oldCodeResponse.status, 200);
+    const oldCodeBody = await json(oldCodeResponse);
+    assert.equal(oldCodeBody.invalidPairingCode, true);
+    assert.deepEqual(outboundContents(calls), [
+      "That pairing code is invalid or expired. Start iMessage Handoff again in Codex to get a fresh code.",
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("unknown senders are acknowledged without enqueueing", async () => {
@@ -1146,6 +1256,143 @@ test("unknown senders are acknowledged without enqueueing", async () => {
   assert.equal(response.status, 200);
   const body = await json(response);
   assert.equal(body.ignored, true);
+});
+
+test("expired pairing codes do not pair and send an invalid code message", async () => {
+  const testEnv = env();
+  const threadId = await register(testEnv);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  const pairingCode = db.threads.get(threadId)?.pairing_code;
+  assert.equal(typeof pairingCode, "string");
+  db.threads.get(threadId)!.pairing_code_expires_at = "2026-01-01T00:00:00.000Z";
+
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: string; body: Record<string, unknown> | null }> = [];
+  globalThis.fetch = async (input, init) => {
+    calls.push({
+      url: String(input),
+      body: init?.body ? JSON.parse(String(init.body)) : null,
+    });
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: `message-${calls.length}` }), { status: 200 });
+  };
+  try {
+    const response = await handleRequest(sendblueWebhook(inboundMessage(String(pairingCode), "expired_pair_msg")), testEnv);
+    assert.equal(response.status, 200);
+    const body = await json(response);
+    assert.equal(body.paired, false);
+    assert.equal(body.invalidPairingCode, true);
+    assert.equal(db.phoneBindings.get("+15551234567"), undefined);
+    assert.deepEqual(calls.map((call) => call.url), [
+      "https://api.sendblue.test/api/mark-read",
+      "https://api.sendblue.test/api/send-message",
+    ]);
+    assert.deepEqual(outboundContents(calls.map((call) => call.body)), [
+      "That pairing code is invalid or expired. Start iMessage Handoff again in Codex to get a fresh code.",
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("failed pairing attempts are rate limited per phone number", async () => {
+  const testEnv = env();
+  await register(testEnv);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  const originalFetch = globalThis.fetch;
+  const calls: Array<Record<string, unknown> | null> = [];
+  globalThis.fetch = async (_input, init) => {
+    calls.push(init?.body ? JSON.parse(String(init.body)) : null);
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: `message-${calls.length}` }), { status: 200 });
+  };
+  try {
+    const badCodes = ["BADA2A", "BADA3A", "BADA4A", "BADA5A", "BADA6A", "BADA7A"];
+    for (let index = 0; index < 5; index += 1) {
+      const response = await handleRequest(sendblueWebhook(inboundMessage(String(badCodes[index]), `bad_pair_${index}`)), testEnv);
+      assert.equal(response.status, 200);
+      const body = await json(response);
+      assert.equal(body.invalidPairingCode, true);
+      assert.equal(body.rateLimited, false);
+    }
+
+    const limited = await handleRequest(sendblueWebhook(inboundMessage(String(badCodes[5]), "bad_pair_6")), testEnv);
+    assert.equal(limited.status, 200);
+    const body = await json(limited);
+    assert.equal(body.paired, false);
+    assert.equal(body.rateLimited, true);
+    assert.equal(typeof body.retryAfterSeconds, "number");
+    assert.equal(Number(body.retryAfterSeconds) > 0, true);
+    assert.equal(db.pairingAttemptLimits.get("+15551234567")?.failed_count, 6);
+    assert.match(String(outboundContents(calls).at(-1)), /Too many pairing attempts\. Try again in about 30 minutes/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("blocked phones cannot pair even with a valid code until the block expires", async () => {
+  const testEnv = env();
+  const threadId = await register(testEnv);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  const pairingCode = String(db.threads.get(threadId)?.pairing_code);
+  db.pairingAttemptLimits.set("+15551234567", {
+    phone_number: "+15551234567",
+    failed_count: 6,
+    window_start_at: new Date().toISOString(),
+    blocked_until: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: string; body: Record<string, unknown> | null }> = [];
+  globalThis.fetch = async (input, init) => {
+    calls.push({
+      url: String(input),
+      body: init?.body ? JSON.parse(String(init.body)) : null,
+    });
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: `message-${calls.length}` }), { status: 200 });
+  };
+  try {
+    const response = await handleRequest(sendblueWebhook(inboundMessage(pairingCode, "blocked_valid_pair")), testEnv);
+    assert.equal(response.status, 200);
+    const body = await json(response);
+    assert.equal(body.rateLimited, true);
+    assert.equal(db.phoneBindings.get("+15551234567"), undefined);
+    assert.deepEqual(calls.map((call) => call.url), [
+      "https://api.sendblue.test/api/mark-read",
+      "https://api.sendblue.test/api/send-message",
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("successful pairing clears prior failed attempts", async () => {
+  const testEnv = env();
+  const threadId = await register(testEnv);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  const pairingCode = String(db.threads.get(threadId)?.pairing_code);
+  db.pairingAttemptLimits.set("+15551234567", {
+    phone_number: "+15551234567",
+    failed_count: 3,
+    window_start_at: new Date().toISOString(),
+    blocked_until: null,
+    updated_at: new Date().toISOString(),
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    if (String(input).includes("/evaluate-service")) {
+      return new Response(JSON.stringify({ number: "+15551234567", service: "iMessage" }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: "message-1" }), { status: 200 });
+  };
+  try {
+    const response = await handleRequest(sendblueWebhook(inboundMessage(pairingCode, "valid_after_failures")), testEnv);
+    assert.equal(response.status, 200);
+    assert.equal((await json(response)).paired, true);
+    assert.equal(db.pairingAttemptLimits.get("+15551234567"), undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("duplicate sendblue message handles are ignored", async () => {
@@ -1419,6 +1666,61 @@ test("uploads one generated image and sends it with send-message", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("rejects status messages that exceed the text cap", async () => {
+  const testEnv = env();
+  const threadId = await register(testEnv);
+  const response = await handleRequest(req(`/threads/${threadId}/status`, {
+    method: "POST",
+    headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({
+      cwd: "/tmp/project",
+      lastAssistantMessage: "x".repeat(20_001),
+      status: "stopped",
+      createdAt: "2026-04-25T18:25:00.000Z",
+    }),
+  }), testEnv);
+  assert.equal(response.status, 413);
+});
+
+test("rejects more than five generated images", async () => {
+  const testEnv = env();
+  const threadId = await register(testEnv);
+  const response = await handleRequest(req(`/threads/${threadId}/status`, {
+    method: "POST",
+    headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({
+      cwd: "/tmp/project",
+      generatedImages: [
+        generatedImage("1.png"),
+        generatedImage("2.png"),
+        generatedImage("3.png"),
+        generatedImage("4.png"),
+        generatedImage("5.png"),
+        generatedImage("6.png"),
+      ],
+      status: "stopped",
+      createdAt: "2026-04-25T18:25:00.000Z",
+    }),
+  }), testEnv);
+  assert.equal(response.status, 413);
+});
+
+test("rejects generated images larger than ten megabytes", async () => {
+  const testEnv = env();
+  const threadId = await register(testEnv);
+  const response = await handleRequest(req(`/threads/${threadId}/status`, {
+    method: "POST",
+    headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({
+      cwd: "/tmp/project",
+      generatedImages: [generatedImageBytes("too-big.png", new Uint8Array((10 * 1024 * 1024) + 1))],
+      status: "stopped",
+      createdAt: "2026-04-25T18:25:00.000Z",
+    }),
+  }), testEnv);
+  assert.equal(response.status, 413);
 });
 
 test("sends text and one generated image together", async () => {

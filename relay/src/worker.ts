@@ -1,5 +1,5 @@
 import { CODEX_CONTACT_IMAGE_BASE64 } from "./contact-card-image.ts";
-import type { Env, PhoneBindingRow, HandoffReplyRow, HandoffThreadRow } from "./types.ts";
+import type { Env, PairingAttemptLimitRow, PhoneBindingRow, HandoffReplyRow, HandoffThreadRow } from "./types.ts";
 
 // The relay is intentionally small: one Worker file handles registration,
 // Sendblue webhooks, local Codex WebSockets, and outbound Sendblue sends.
@@ -19,6 +19,39 @@ const CONTACT_CARD_IMAGE_FILENAME = "codex-contact.jpg";
 const THREAD_LIST_COMMANDS = new Set(["list", "threads"]);
 const NO_HANDOFF_THREADS_MESSAGE = "You have no iMessage handoff threads";
 const SWITCH_RANGE_MESSAGE = "Text threads to see active iMessage handoff threads.";
+
+// Pairing is the security boundary that lets an iMessage sender control a local
+// Codex thread. Codes are intentionally short for human texting, so they expire
+// quickly and failed code-shaped guesses are throttled by phone number.
+const PAIRING_CODE_TTL_MS = 15 * 60 * 1000;
+const PAIRING_ATTEMPT_WINDOW_MS = 60 * 60 * 1000;
+const PAIRING_ATTEMPT_BLOCK_MS = 30 * 60 * 1000;
+const MAX_PAIRING_FAILURES_PER_WINDOW = 5;
+const INVALID_PAIRING_CODE_MESSAGE = "That pairing code is invalid or expired. Start iMessage Handoff again in Codex to get a fresh code.";
+
+// Abuse controls are deliberately boring. Sendblue is billed per phone number,
+// so the practical hosted-relay risk is oversized payloads and noisy request
+// floods, not per-message spend. These caps fail requests before large parsing,
+// D1 growth, or media upload work can run away.
+const DEFAULT_JSON_BODY_MAX_BYTES = 128 * 1024;
+const WEBHOOK_JSON_BODY_MAX_BYTES = 256 * 1024;
+const STATUS_JSON_BODY_MAX_BYTES = 72 * 1024 * 1024;
+const REQUEST_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
+const MAX_INSTALLATIONS_PER_IP_PER_WINDOW = 30;
+const MAX_THREAD_REQUESTS_PER_IP_PER_WINDOW = 1000;
+const MAX_OWNER_REQUESTS_PER_WINDOW = 1000;
+const MAX_CWD_LENGTH = 512;
+const MAX_TITLE_LENGTH = 120;
+const MAX_HANDOFF_SUMMARY_LENGTH = 1000;
+const MAX_STATUS_LENGTH = 40;
+const MAX_ASSISTANT_MESSAGE_LENGTH = 20_000;
+const MAX_WEBHOOK_CONTENT_LENGTH = 20_000;
+const MAX_URL_LENGTH = 2048;
+const MAX_ENABLED_THREADS_PER_OWNER = 25;
+const MAX_GENERATED_IMAGES = 5;
+const MAX_GENERATED_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_GENERATED_IMAGE_TOTAL_BYTES = MAX_GENERATED_IMAGES * MAX_GENERATED_IMAGE_BYTES;
+const ALLOWED_GENERATED_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 // Sendblue can deliver one image as several webhooks. Wait briefly before
 // surfacing grouped media so Codex receives one complete iMessage reply.
 const MEDIA_GROUP_QUIET_MS = 3000;
@@ -64,6 +97,10 @@ export class HandoffSocket {
   // This is the in-memory message buffer. When HANDOFF_SOCKET is bound,
   // inbound message text/media does not go to D1; it lives here until claim.
   private readonly replies = new Map<string, HandoffReplyRow>();
+  // Soft hourly request counters live in the same global DO as the reply buffer.
+  // They are intentionally in-memory: if the DO restarts, the counters reset,
+  // which is fine for a lightweight abuse brake and avoids a D1 write per hit.
+  private readonly requestLimits = new Map<string, { count: number; windowStartMs: number }>();
 
   constructor(state: DurableObjectState) {
     this.state = state;
@@ -92,6 +129,9 @@ export class HandoffSocket {
       }
       if (request.method === "GET" && parts[0] === "external-replies" && parts[1] && parts.length === 2) {
         return json({ exists: this.hasExternalReply(parts[1]) });
+      }
+      if (request.method === "POST" && parts[0] === "rate-limit" && parts.length === 1) {
+        return await this.handleRateLimit(request);
       }
       return error(404, "Not found.");
     }
@@ -148,6 +188,34 @@ export class HandoffSocket {
 
   private hasExternalReply(externalId: string) {
     return [...this.replies.values()].some((reply) => reply.external_id === externalId);
+  }
+
+  private async handleRateLimit(request: Request) {
+    // The Worker asks the DO to count request buckets before it enters the more
+    // expensive route handlers. This does not stop traffic at Cloudflare's edge,
+    // but it keeps one IP/token from repeatedly driving D1 and Sendblue paths.
+    const body = await readJsonBody<{ key?: unknown; limit?: unknown; windowMs?: unknown }>(request);
+    const key = requireLimitedString(body.key, "key", 200);
+    const limit = Number(body.limit);
+    const windowMs = Number(body.windowMs);
+    if (!Number.isInteger(limit) || limit < 1 || !Number.isInteger(windowMs) || windowMs < 1000) {
+      throw new Error("Invalid rate limit.");
+    }
+
+    const now = Date.now();
+    const current = this.requestLimits.get(key);
+    const next = !current || current.windowStartMs + windowMs <= now
+      ? { count: 1, windowStartMs: now }
+      : { count: current.count + 1, windowStartMs: current.windowStartMs };
+    this.requestLimits.set(key, next);
+    return json({
+      ok: true,
+      allowed: next.count <= limit,
+      count: next.count,
+      retryAfterSeconds: next.count <= limit
+        ? 0
+        : Math.max(1, Math.ceil((next.windowStartMs + windowMs - now) / 1000)),
+    });
   }
 
   private async handleInsertReply(request: Request, threadId: string) {
@@ -296,8 +364,22 @@ function error(status: number, message: string) {
   return json({ error: message }, { status });
 }
 
-async function readJsonBody<T>(request: Request): Promise<T> {
+function requestTooLarge(message: string) {
+  throw Object.assign(new Error(message), { status: 413 });
+}
+
+async function readJsonBody<T>(request: Request, maxBytes = DEFAULT_JSON_BODY_MAX_BYTES): Promise<T> {
+  // Workers Free/Pro can accept much larger bodies than this app needs. Check
+  // Content-Length when present, then verify the actual decoded text size so
+  // chunked requests cannot sneak around the cap.
+  const contentLength = Number(request.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    requestTooLarge("Request body is too large.");
+  }
   const text = await request.text();
+  if (new TextEncoder().encode(text).byteLength > maxBytes) {
+    requestTooLarge("Request body is too large.");
+  }
   if (!text.trim()) {
     return {} as T;
   }
@@ -329,8 +411,36 @@ function optionalString(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
+function assertMaxLength(value: string | null, name: string, maxLength: number) {
+  if (value && value.length > maxLength) {
+    throw Object.assign(new Error(`${name} must be ${maxLength} characters or fewer.`), { status: 413 });
+  }
+  return value;
+}
+
+function requireLimitedString(value: unknown, name: string, maxLength: number) {
+  return assertMaxLength(requireString(value, name), name, maxLength) as string;
+}
+
+function optionalLimitedString(value: unknown, name: string, maxLength: number) {
+  return assertMaxLength(optionalString(value), name, maxLength);
+}
+
+function rateLimited(message = "Too many requests. Try again later.") {
+  throw Object.assign(new Error(message), { status: 429 });
+}
+
 function nowIso() {
   return new Date().toISOString();
+}
+
+function isoFromMs(ms: number) {
+  return new Date(ms).toISOString();
+}
+
+function clientIp(request: Request) {
+  const forwardedFor = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+  return request.headers.get("cf-connecting-ip")?.trim() || forwardedFor || "unknown";
 }
 
 function sleep(ms: number) {
@@ -375,6 +485,10 @@ function makePairingCode() {
   return [...bytes].map((byte) => alphabet[byte % alphabet.length]).join("");
 }
 
+function isPairingCodeCandidate(content: string | null) {
+  return Boolean(content && /^[A-Z2-9]{6}$/.test(content.trim().toUpperCase()));
+}
+
 async function findThread(env: Env, threadId: string) {
   return env.DB.prepare("SELECT * FROM handoff_threads WHERE id = ?")
     .bind(threadId)
@@ -400,6 +514,7 @@ function publicThread(thread: HandoffThreadRow) {
     status: thread.status,
     handoffEnabled: thread.handoff_enabled === 1,
     pairingCode: thread.pairing_code,
+    pairingCodeExpiresAt: thread.pairing_code_expires_at,
     lastStopAt: thread.last_stop_at,
     createdAt: thread.created_at,
     updatedAt: thread.updated_at,
@@ -411,23 +526,31 @@ async function handleRegister(request: Request, env: Env, threadId: string) {
   // paired, this also switches that phone's active thread to the new one.
   const body = await readJsonBody<RegisterBody>(request);
   const ownerId = await requireOwnerId(request);
-  const cwd = requireString(body.cwd, "cwd");
-  const title = optionalString(body.title);
-  const handoffSummary = optionalString(body.handoffSummary);
+  const cwd = requireLimitedString(body.cwd, "cwd", MAX_CWD_LENGTH);
+  const title = optionalLimitedString(body.title, "title", MAX_TITLE_LENGTH);
+  const handoffSummary = optionalLimitedString(body.handoffSummary, "handoffSummary", MAX_HANDOFF_SUMMARY_LENGTH);
   const existingThread = await findThread(env, threadId);
   if (existingThread) {
     assertAuthorized(existingThread, ownerId);
   }
+  // Metadata is cheap, but not free. Keep one install token from leaving an
+  // unlimited pile of enabled thread rows behind on the hosted relay.
+  const enabledThreads = await listEnabledThreadsForOwner(env, ownerId);
+  const alreadyEnabled = existingThread?.handoff_enabled === 1;
+  if (!alreadyEnabled && enabledThreads.length >= MAX_ENABLED_THREADS_PER_OWNER) {
+    rateLimited("Too many active handoff threads. Stop an existing thread before starting another.");
+  }
   const existingBinding = await findPhoneBindingForOwner(env, ownerId);
   const pairingRequired = !existingBinding;
   const pairingCode = pairingRequired ? makePairingCode() : null;
+  const pairingCodeExpiresAt = pairingRequired ? isoFromMs(Date.now() + PAIRING_CODE_TTL_MS) : null;
   const createdAt = nowIso();
 
   await env.DB.prepare(
     `INSERT INTO handoff_threads (
       id, owner_id, cwd, title, handoff_summary, status, handoff_enabled, pairing_code,
-      last_stop_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, 'enabled', 1, ?, NULL, ?, ?)
+      pairing_code_expires_at, last_stop_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'enabled', 1, ?, ?, NULL, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       owner_id = excluded.owner_id,
       cwd = excluded.cwd,
@@ -436,11 +559,12 @@ async function handleRegister(request: Request, env: Env, threadId: string) {
       status = 'enabled',
       handoff_enabled = 1,
       pairing_code = excluded.pairing_code,
+      pairing_code_expires_at = excluded.pairing_code_expires_at,
       updated_at = excluded.updated_at`,
-  ).bind(threadId, ownerId, cwd, title, handoffSummary, pairingCode, createdAt, createdAt).run();
+  ).bind(threadId, ownerId, cwd, title, handoffSummary, pairingCode, pairingCodeExpiresAt, createdAt, createdAt).run();
 
   await env.DB.prepare(
-    "UPDATE handoff_threads SET pairing_code = NULL, updated_at = ? WHERE owner_id = ? AND id != ?",
+    "UPDATE handoff_threads SET pairing_code = NULL, pairing_code_expires_at = NULL, updated_at = ? WHERE owner_id = ? AND id != ?",
   ).bind(createdAt, ownerId, threadId).run();
 
   if (existingBinding) {
@@ -459,6 +583,7 @@ async function handleRegister(request: Request, env: Env, threadId: string) {
     paired: Boolean(existingBinding),
     pairingRequired,
     pairingCode,
+    pairingCodeExpiresAt,
     skipNextStatusSend: Boolean(existingBinding),
   });
 }
@@ -480,9 +605,86 @@ async function findPhoneBindingForOwner(env: Env, ownerId: string) {
 }
 
 async function findPairingThread(env: Env, pairingCode: string) {
-  return env.DB.prepare("SELECT * FROM handoff_threads WHERE pairing_code = ? AND handoff_enabled = 1")
-    .bind(pairingCode)
+  return env.DB.prepare("SELECT * FROM handoff_threads WHERE pairing_code = ? AND handoff_enabled = 1 AND pairing_code_expires_at > ?")
+    .bind(pairingCode, nowIso())
     .first<HandoffThreadRow>();
+}
+
+async function findPairingAttemptLimit(env: Env, phoneNumber: string) {
+  return env.DB.prepare("SELECT phone_number, failed_count, window_start_at, blocked_until, updated_at FROM pairing_attempt_limits WHERE phone_number = ?")
+    .bind(phoneNumber)
+    .first<PairingAttemptLimitRow>();
+}
+
+async function enforceRequestRateLimit(env: Env, bucketKey: string, limit: number) {
+  // Keep the public route handlers simple: they declare a bucket and limit, and
+  // this helper delegates the actual counter to HandoffSocket's in-memory map.
+  const response = await relaySocket(env)
+    .fetch(new Request("https://imessage-handoff.internal/rate-limit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key: bucketKey, limit, windowMs: REQUEST_RATE_LIMIT_WINDOW_MS }),
+    }));
+  const body = await response.json() as { allowed?: boolean };
+  if (!response.ok || body.allowed !== true) {
+    rateLimited();
+  }
+}
+
+function retryAfterSeconds(blockedUntil: string, nowMs = Date.now()) {
+  const blockedUntilMs = Date.parse(blockedUntil);
+  if (!Number.isFinite(blockedUntilMs)) {
+    return 0;
+  }
+  return Math.max(0, Math.ceil((blockedUntilMs - nowMs) / 1000));
+}
+
+function pairingRateLimitMessage(seconds: number) {
+  const minutes = Math.max(1, Math.ceil(seconds / 60));
+  return `Too many pairing attempts. Try again in about ${minutes} minutes, or start iMessage Handoff again in Codex for a fresh code.`;
+}
+
+async function pairingRateLimitStatus(env: Env, phoneNumber: string) {
+  const row = await findPairingAttemptLimit(env, phoneNumber);
+  if (!row?.blocked_until) {
+    return { blocked: false, retryAfterSeconds: 0 };
+  }
+  const seconds = retryAfterSeconds(row.blocked_until);
+  return { blocked: seconds > 0, retryAfterSeconds: seconds };
+}
+
+async function recordFailedPairingAttempt(env: Env, phoneNumber: string) {
+  const nowMs = Date.now();
+  const now = isoFromMs(nowMs);
+  const row = await findPairingAttemptLimit(env, phoneNumber);
+  const windowExpired = !row || !Number.isFinite(Date.parse(row.window_start_at))
+    || Date.parse(row.window_start_at) + PAIRING_ATTEMPT_WINDOW_MS <= nowMs;
+  const windowStartAt = windowExpired ? now : row.window_start_at;
+  const failedCount = windowExpired ? 1 : row.failed_count + 1;
+  const blockedUntil = failedCount > MAX_PAIRING_FAILURES_PER_WINDOW
+    ? isoFromMs(nowMs + PAIRING_ATTEMPT_BLOCK_MS)
+    : null;
+
+  await env.DB.prepare(
+    `INSERT INTO pairing_attempt_limits (phone_number, failed_count, window_start_at, blocked_until, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(phone_number) DO UPDATE SET
+        failed_count = excluded.failed_count,
+        window_start_at = excluded.window_start_at,
+        blocked_until = excluded.blocked_until,
+        updated_at = excluded.updated_at`,
+  ).bind(phoneNumber, failedCount, windowStartAt, blockedUntil, now).run();
+
+  return {
+    blocked: Boolean(blockedUntil),
+    retryAfterSeconds: blockedUntil ? retryAfterSeconds(blockedUntil, nowMs) : 0,
+  };
+}
+
+async function clearPairingAttempts(env: Env, phoneNumber: string) {
+  await env.DB.prepare("DELETE FROM pairing_attempt_limits WHERE phone_number = ?")
+    .bind(phoneNumber)
+    .run();
 }
 
 async function findExternalReply(env: Env, externalId: string) {
@@ -782,13 +984,26 @@ function formatForSendblue(content: string) {
     .trim();
 }
 
+function base64DecodedLength(value: string) {
+  // Calculate decoded size before calling atob. That lets us reject oversized
+  // generated images without first allocating the decoded byte array.
+  const clean = value.replace(/\s/g, "");
+  if (!clean || clean.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(clean)) {
+    throw new Error("Generated image data must be valid base64.");
+  }
+  const padding = clean.endsWith("==") ? 2 : clean.endsWith("=") ? 1 : 0;
+  return (clean.length / 4) * 3 - padding;
+}
+
 function parseGeneratedImages(value: unknown) {
-  // The local Stop hook sends generated images as base64. Cap the list so a
-  // malformed local payload cannot create unbounded upload work.
+  // The local Stop hook sends generated images as base64. Limit both count and
+  // decoded bytes before upload so a compromised token cannot use /status as a
+  // general large-file ingress path.
   if (!Array.isArray(value)) {
     return [];
   }
   const images: GeneratedImageInput[] = [];
+  let totalBytes = 0;
   for (const item of value) {
     if (!isRecord(item)) {
       continue;
@@ -797,13 +1012,28 @@ function parseGeneratedImages(value: unknown) {
     if (!dataBase64) {
       continue;
     }
+    const mimeType = optionalString(item.mimeType) ?? "image/png";
+    if (!ALLOWED_GENERATED_IMAGE_MIME_TYPES.has(mimeType)) {
+      throw new Error("Generated image mimeType is not supported.");
+    }
+    const decodedBytes = base64DecodedLength(dataBase64);
+    if (decodedBytes > MAX_GENERATED_IMAGE_BYTES) {
+      requestTooLarge("Generated image is too large.");
+    }
+    totalBytes += decodedBytes;
+    if (totalBytes > MAX_GENERATED_IMAGE_TOTAL_BYTES) {
+      requestTooLarge("Generated images are too large.");
+    }
+    if (images.length >= MAX_GENERATED_IMAGES) {
+      requestTooLarge("Too many generated images.");
+    }
     images.push({
       dataBase64,
-      filename: optionalString(item.filename) ?? "image.png",
-      mimeType: optionalString(item.mimeType) ?? "image/png",
+      filename: optionalLimitedString(item.filename, "filename", 120) ?? "image.png",
+      mimeType,
     });
   }
-  return images.slice(0, 20);
+  return images;
 }
 
 function base64ToBytes(value: string) {
@@ -1020,14 +1250,16 @@ async function lookupPairingService(env: Env, phoneNumber: string) {
 async function handleStatus(request: Request, env: Env, threadId: string) {
   // Called by the Stop hook after Codex finishes a local turn. It updates thread
   // status and forwards the final assistant reply back to iMessage if paired.
-  const body = await readJsonBody<StatusBody>(request);
+  // This is the only route that legitimately carries large bodies because
+  // generated images arrive here as base64.
+  const body = await readJsonBody<StatusBody>(request, STATUS_JSON_BODY_MAX_BYTES);
   const ownerId = await requireOwnerId(request);
   const thread = assertAuthorized(await findThread(env, threadId), ownerId);
   const updatedAt = nowIso();
-  const lastStopAt = optionalString(body.createdAt) ?? updatedAt;
-  const status = optionalString(body.status) ?? "stopped";
-  const cwd = optionalString(body.cwd) ?? thread.cwd;
-  const lastAssistantMessage = optionalString(body.lastAssistantMessage);
+  const lastStopAt = optionalLimitedString(body.createdAt, "createdAt", 64) ?? updatedAt;
+  const status = optionalLimitedString(body.status, "status", MAX_STATUS_LENGTH) ?? "stopped";
+  const cwd = optionalLimitedString(body.cwd, "cwd", MAX_CWD_LENGTH) ?? thread.cwd;
+  const lastAssistantMessage = optionalLimitedString(body.lastAssistantMessage, "lastAssistantMessage", MAX_ASSISTANT_MESSAGE_LENGTH);
   const generatedImages = parseGeneratedImages(body.generatedImages);
   let notification: JsonRecord | null = null;
 
@@ -1141,12 +1373,12 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: Execution
     return error(401, "Unauthorized.");
   }
 
-  const body = await readJsonBody<SendblueWebhookBody>(request);
-  const content = optionalString(body.content);
-  const mediaUrl = optionalString(body.media_url);
-  const fromNumber = optionalString(body.from_number) ?? optionalString(body.number);
-  const externalId = optionalString(body.message_handle);
-  const status = optionalString(body.status);
+  const body = await readJsonBody<SendblueWebhookBody>(request, WEBHOOK_JSON_BODY_MAX_BYTES);
+  const content = optionalLimitedString(body.content, "content", MAX_WEBHOOK_CONTENT_LENGTH);
+  const mediaUrl = optionalLimitedString(body.media_url, "media_url", MAX_URL_LENGTH);
+  const fromNumber = optionalLimitedString(body.from_number, "from_number", 64) ?? optionalLimitedString(body.number, "number", 64);
+  const externalId = optionalLimitedString(body.message_handle, "message_handle", 200);
+  const status = optionalLimitedString(body.status, "status", MAX_STATUS_LENGTH);
   const isOutbound = body.is_outbound === true || String(body.is_outbound).toLowerCase() === "true";
 
   if (isOutbound || status?.toUpperCase() !== "RECEIVED" || (!content && !mediaUrl) || !fromNumber) {
@@ -1162,7 +1394,24 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: Execution
     return json({ ok: true, duplicate: true });
   }
 
-  const pairingThread = content ? await findPairingThread(env, content.toUpperCase()) : null;
+  const pairingCodeCandidate = content ? content.toUpperCase() : null;
+  const looksLikePairingCode = isPairingCodeCandidate(pairingCodeCandidate);
+  if (looksLikePairingCode) {
+    // A blocked phone should not even reach Sendblue service lookup. This keeps
+    // repeated guesses from doing provider work after the local block is active.
+    const limit = await pairingRateLimitStatus(env, fromNumber);
+    if (limit.blocked) {
+      await sendControlMessage(env, fromNumber, pairingRateLimitMessage(limit.retryAfterSeconds));
+      return json({
+        ok: true,
+        paired: false,
+        rateLimited: true,
+        retryAfterSeconds: limit.retryAfterSeconds,
+      });
+    }
+  }
+
+  const pairingThread = looksLikePairingCode ? await findPairingThread(env, pairingCodeCandidate ?? "") : null;
   if (pairingThread) {
     // First-time setup: user texts the pairing code, linking this phone number
     // to the owner id derived from the local install token.
@@ -1188,8 +1437,9 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: Execution
           updated_at = excluded.updated_at`,
     ).bind(fromNumber, pairingThread.owner_id, pairingThread.id, now, now).run();
     await env.DB.prepare(
-      "UPDATE handoff_threads SET pairing_code = NULL, updated_at = ? WHERE id = ?",
+      "UPDATE handoff_threads SET pairing_code = NULL, pairing_code_expires_at = NULL, updated_at = ? WHERE id = ?",
     ).bind(now, pairingThread.id).run();
+    await clearPairingAttempts(env, fromNumber);
     if (externalId) {
       await insertHandoffReply(env, pairingThread.id, content ?? "", externalId, "applied");
     }
@@ -1214,6 +1464,22 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: Execution
 
   const binding = await findPhoneBinding(env, fromNumber);
   if (!binding) {
+    if (looksLikePairingCode) {
+      // Unknown normal texts are ignored, but code-shaped texts get a helpful
+      // response and count against the phone's pairing-attempt window.
+      const limit = await recordFailedPairingAttempt(env, fromNumber);
+      const message = limit.blocked
+        ? pairingRateLimitMessage(limit.retryAfterSeconds)
+        : INVALID_PAIRING_CODE_MESSAGE;
+      await sendControlMessage(env, fromNumber, message);
+      return json({
+        ok: true,
+        paired: false,
+        invalidPairingCode: !limit.blocked,
+        rateLimited: limit.blocked,
+        retryAfterSeconds: limit.retryAfterSeconds,
+      });
+    }
     return json({ ok: true, ignored: true });
   }
 
@@ -1284,6 +1550,7 @@ async function handleStopThread(request: Request, env: Env, threadId: string) {
       SET status = 'stopped',
           handoff_enabled = 0,
           pairing_code = NULL,
+          pairing_code_expires_at = NULL,
           updated_at = ?
       WHERE id = ?`,
   ).bind(stoppedAt, threadId).run();
@@ -1348,11 +1615,22 @@ export async function handleRequest(request: Request, env: Env, ctx?: ExecutionC
     }
 
     if (request.method === "POST" && url.pathname === "/installations") {
+      // Install tokens are anonymous identity creation. This IP bucket is a
+      // coarse speed bump for scripts minting tokens in a loop.
+      await enforceRequestRateLimit(env, `installations:${clientIp(request)}`, MAX_INSTALLATIONS_PER_IP_PER_WINDOW);
       return handleCreateInstallation();
     }
 
     if (parts[0] === "threads" && parts[1]) {
       const threadId = parts[1];
+      // Thread APIs are authenticated, but an attacker can still send random
+      // bearer tokens. Use both IP and owner buckets: IP slows random-token
+      // spray, owner slows one real token from hammering expensive routes.
+      await enforceRequestRateLimit(env, `threads-ip:${clientIp(request)}`, MAX_THREAD_REQUESTS_PER_IP_PER_WINDOW);
+      const token = authTokenFromRequestOrUrl(request);
+      if (token) {
+        await enforceRequestRateLimit(env, `owner:${await ownerIdFromToken(token)}`, MAX_OWNER_REQUESTS_PER_WINDOW);
+      }
       if (request.method === "GET" && parts[2] === "events" && parts.length === 3) {
         return await handleThreadEvents(request, env, threadId);
       }
